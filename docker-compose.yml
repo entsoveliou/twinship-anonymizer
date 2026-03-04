@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: encryption-api
+    ports:
+      - "8000:8000"
+    environment:
+      # MinIO Configuration
+      - MINIO_ENDPOINT=minio-api.twinship.epu.ntua.gr
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin123
+      # Set to True for HTTPS, False for HTTP
+      - MINIO_SECURE=True
+
+      # Bucket Configuration
+      - SOURCE_BUCKET=demo-data
+      - DESTINATION_BUCKET=encrypted-files
+
+      # App Settings
+      - POLL_INTERVAL=5
+    restart: unless-stopped
