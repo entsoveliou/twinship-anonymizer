@@ -14,7 +14,8 @@ from typing import Optional
 import settings
 import functions
 import crypto_utils
-from auth import verify_token, get_roles
+from auth import get_roles
+from abac import require_dataset_access, get_dataset_encryption_attributes
 
 # --- MinIO Client Setup (For Background Monitor) ---
 minio_client = Minio(
@@ -137,10 +138,11 @@ async def issue_dev_token(
 async def list_files(roles: list[str] = Depends(get_roles)):
     """
     Returns a JSON array of all file names in the encrypted bucket.
+    Requires a valid JWT (no dataset-level ABAC).
     """
     try:
         files = functions.list_files_in_encrypted_bucket()
-        return {"files": files, "count": len(files), "roles": roles}
+        return {"files": files, "count": len(files)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -148,23 +150,26 @@ async def list_files(roles: list[str] = Depends(get_roles)):
 @app.get("/api/v1/getUnencryptedFile")
 async def get_unencrypted_file(filename: str, roles: list[str] = Depends(get_roles)):
     """
-    Downloads the file, decrypts it using ABE attributes,
-    and returns the clean file content.
+    Downloads the file, decrypts it, and returns the clean content.
+    Dataset ABAC: checks the user's roles against the dataset's policy.
     """
     try:
-        # 1. Download raw encrypted bytes from MinIO (using functions.py)
+        # 1. Check dataset-level ABAC (raises 403 if denied)
+        require_dataset_access(filename, roles)
+
+        # 2. Download raw encrypted bytes from MinIO
         encrypted_bytes = functions.download_file_from_encrypted_bucket(filename)
 
-        # 2. Define Attributes (Simulated ABE)
-        user_attributes = ['itsec', 'csirt', 'euisac']
+        # 3. Get the encryption attributes for this dataset from the policy
+        encryption_attributes = get_dataset_encryption_attributes(filename)
 
-        # 3. Decrypt (using crypto_utils.py)
-        decrypted_bytes = crypto_utils.decrypt_data(encrypted_bytes, user_attributes)
+        # 4. Decrypt
+        decrypted_bytes = crypto_utils.decrypt_data(encrypted_bytes, encryption_attributes)
 
         if decrypted_bytes is None:
             raise HTTPException(status_code=403, detail="Decryption Failed: Invalid attributes or corrupted data.")
 
-        # 4. Return as a file download
+        # 5. Return as a file download
         return Response(
             content=decrypted_bytes,
             media_type="application/octet-stream",
@@ -174,7 +179,6 @@ async def get_unencrypted_file(filename: str, roles: list[str] = Depends(get_rol
     except S3Error:
         raise HTTPException(status_code=404, detail="File not found in encrypted bucket")
     except Exception as e:
-        # If it's already an HTTPException, raise it, otherwise generic 500
         if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -183,12 +187,16 @@ async def get_unencrypted_file(filename: str, roles: list[str] = Depends(get_rol
 async def get_encrypted_file(filename: str, roles: list[str] = Depends(get_roles)):
     """
     Downloads the file and returns it AS IS (still encrypted).
+    Dataset ABAC: checks the user's roles against the dataset's policy.
     """
     try:
-        # 1. Download raw encrypted bytes from MinIO (using functions.py)
+        # 1. Check dataset-level ABAC (raises 403 if denied)
+        require_dataset_access(filename, roles)
+
+        # 2. Download raw encrypted bytes from MinIO
         encrypted_bytes = functions.download_file_from_encrypted_bucket(filename)
 
-        # 2. Return directly without decryption
+        # 3. Return directly without decryption
         return Response(
             content=encrypted_bytes,
             media_type="application/octet-stream",
@@ -198,6 +206,7 @@ async def get_encrypted_file(filename: str, roles: list[str] = Depends(get_roles
     except S3Error:
         raise HTTPException(status_code=404, detail="File not found in encrypted bucket")
     except Exception as e:
+        if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=str(e))
 
 
