@@ -15,3 +15,22 @@ DESTINATION_BUCKET = os.getenv("DESTINATION_BUCKET", "encrypted-files")
 
 # --- App Configuration ---
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 5)) # Seconds
+
+# --- JWT / Auth Configuration ---
+JWT_ALGORITHM = "RS256"
+
+# In production, set JWT_PUBLIC_KEY env var to the Keycloak realm public key (PEM format).
+# For development, the key is loaded from dev_keys/public.pem.
+_default_public_key = ""
+_default_private_key = ""
+try:
+    with open(os.path.join(os.path.dirname(__file__), "dev_keys", "public.pem")) as f:
+        _default_public_key = f.read()
+    with open(os.path.join(os.path.dirname(__file__), "dev_keys", "private.pem")) as f:
+        _default_private_key = f.read()
+except FileNotFoundError:
+    pass
+
+JWT_PUBLIC_KEY = os.getenv("JWT_PUBLIC_KEY", _default_public_key)
+# Private key is ONLY used by the dev token endpoint — never in production
+JWT_PRIVATE_KEY = os.getenv("JWT_PRIVATE_KEY", _default_private_key)

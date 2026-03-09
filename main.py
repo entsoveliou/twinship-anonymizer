@@ -1,16 +1,20 @@
 # main.py
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, Depends, Query
 from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
 from minio import Minio
 from minio.error import S3Error
 import asyncio
 import io
+import jwt
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 # Custom Modules
 import settings
 import functions
 import crypto_utils
+from auth import verify_token, get_roles
 
 # --- MinIO Client Setup (For Background Monitor) ---
 minio_client = Minio(
@@ -92,22 +96,57 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-# --- API V1 Endpoints ---
+# --- Dev Token Endpoint (development only) ---
+
+@app.post("/api/v1/dev/token")
+async def issue_dev_token(
+    sub: str = Query("dev-user", description="Subject (user id)"),
+    preferred_username: str = Query("developer", description="Username"),
+    roles: str = Query(
+        "default-roles-twinship,offline_access,developer,uma_authorization,operator",
+        description="Comma-separated list of roles",
+    ),
+    expires_in: int = Query(3600, description="Token lifetime in seconds"),
+):
+    """
+    DEV ONLY — Issues a signed JWT using the local dev private key.
+    This endpoint should be disabled or removed in production.
+    """
+    if not settings.JWT_PRIVATE_KEY:
+        raise HTTPException(status_code=501, detail="No private key configured. This endpoint is for development only.")
+
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": sub,
+        "preferred_username": preferred_username,
+        "roles": [r.strip() for r in roles.split(",")],
+        "realm_access": {
+            "roles": [r.strip() for r in roles.split(",")]
+        },
+        "iat": now,
+        "exp": now + timedelta(seconds=expires_in),
+        "iss": "dev-issuer",
+    }
+    token = jwt.encode(payload, settings.JWT_PRIVATE_KEY, algorithm=settings.JWT_ALGORITHM)
+    return {"access_token": token, "token_type": "bearer", "expires_in": expires_in}
+
+
+# --- API V1 Endpoints (protected) ---
 
 @app.get("/api/v1/listFiles")
-async def list_files():
+async def list_files(roles: list[str] = Depends(get_roles)):
     """
     Returns a JSON array of all file names in the encrypted bucket.
     """
     try:
         files = functions.list_files_in_encrypted_bucket()
-        return {"files": files, "count": len(files)}
+        return {"files": files, "count": len(files), "roles": roles}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/v1/getUnencryptedFile")
-async def get_unencrypted_file(filename: str):
+async def get_unencrypted_file(filename: str, roles: list[str] = Depends(get_roles)):
     """
     Downloads the file, decrypts it using ABE attributes,
     and returns the clean file content.
@@ -117,7 +156,6 @@ async def get_unencrypted_file(filename: str):
         encrypted_bytes = functions.download_file_from_encrypted_bucket(filename)
 
         # 2. Define Attributes (Simulated ABE)
-        # In a real scenario, these come from the authenticated user
         user_attributes = ['itsec', 'csirt', 'euisac']
 
         # 3. Decrypt (using crypto_utils.py)
@@ -142,7 +180,7 @@ async def get_unencrypted_file(filename: str):
 
 
 @app.get("/api/v1/getEncryptedFile")
-async def get_encrypted_file(filename: str):
+async def get_encrypted_file(filename: str, roles: list[str] = Depends(get_roles)):
     """
     Downloads the file and returns it AS IS (still encrypted).
     """
