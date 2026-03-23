@@ -8,11 +8,13 @@ services:
       - "8000:8000"
     environment:
       # MinIO Configuration
-      - MINIO_ENDPOINT=minio-api.twinship.epu.ntua.gr
+      - MINIO_ENDPOINT=minio-api.vessel-ai.eu
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin123
       # Set to True for HTTPS, False for HTTP
       - MINIO_SECURE=True
+      - RETENTION_SECONDS=30
+      - RETENTION_PREFIX=weather
 
       # Bucket Configuration
       - SOURCE_BUCKET=demo-data

@@ -4,6 +4,7 @@ from minio.error import S3Error
 import io
 import settings
 from crypto_utils import encrypt_data
+from abac import get_dataset_encryption_attributes
 
 
 # Helper to get client (avoids repeating code)
@@ -28,8 +29,8 @@ def upload_to_encrypted_bucket(object_name, file_data_bytes):
         if not client.bucket_exists(dest_bucket):
             client.make_bucket(dest_bucket)
 
-        # Attributes used for encryption
-        attributes = ['itsec', 'csirt', 'euisac']
+        # Get encryption attributes from the dataset's ABAC policy
+        attributes = get_dataset_encryption_attributes(object_name)
 
         print(f"Encrypting '{object_name}' with attributes: {attributes}...")
         encrypted_bytes = encrypt_data(file_data_bytes, attributes)
