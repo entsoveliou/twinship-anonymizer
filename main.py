@@ -14,7 +14,7 @@ from typing import Optional
 import settings
 import functions
 import crypto_utils
-from auth import get_roles
+from auth import get_roles, verify_token
 from abac import require_dataset_access, get_dataset_encryption_attributes
 from policies_router import router as policies_router
 
@@ -193,6 +193,17 @@ async def issue_dev_token(
 
 
 # --- API V1 Endpoints (protected) ---
+
+@app.get("/api/v1/verifyToken")
+async def verify_jwt(payload: dict = Depends(verify_token)):
+    """
+    Returns whether the provided Bearer token is valid.
+    verify_token raises 401 automatically on invalid/expired tokens,
+    so reaching this point always means the token is valid.
+    """
+    return {"valid": True}
+
+
 
 @app.get("/api/v1/listFiles")
 async def list_files(roles: list[str] = Depends(get_roles)):
