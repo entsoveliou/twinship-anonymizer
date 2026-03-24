@@ -1,46 +1,27 @@
 # abac.py
 from fastapi import HTTPException, status
+from pymongo import MongoClient
 
+import settings
 
-# --- Hardcoded per-dataset ABAC policies ---
-# Each dataset defines:
-#   - required_roles: roles the user must have to access this dataset
-#   - match: "any" (at least one role) or "all" (every role)
-#   - encryption_attributes: the attributes used for encryption/decryption (AAD)
-#
-# If no specific policy exists, DEFAULT_DATASET_POLICY is used.
-
-DATASET_POLICIES = {
-    "dataset1.pdf": {
-        "required_roles": ["itsec", "csirt", "admin"],
-        "match": "all",
-        "encryption_attributes": ["itsec", "csirt", "euisac"],
-    },
-    "dataset2.pdf": {
-        "required_roles": ["itsec", "admin"],
-        "match": "any",
-        "encryption_attributes": ["itsec", "csirt"],
-    },
-    "dataset3.pdf": {
-        "required_roles": ["csirt", "admin"],
-        "match": "any",
-        "encryption_attributes": ["csirt", "euisac"],
-    },
-}
-
-DEFAULT_DATASET_POLICY = {
-    "required_roles": ["developer", "operator"],
-    "match": "all",
-    "encryption_attributes": ["itsec", "csirt", "euisac"],
-}
+_client = MongoClient(settings.MONGO_URI)
+_collection = _client[settings.MONGO_DB]["policies"]
 
 
 def get_dataset_policy(filename: str) -> dict:
     """
-    Returns the ABAC policy for a specific dataset.
-    Falls back to DEFAULT_DATASET_POLICY if no specific rule exists.
+    Returns the ABAC policy for a specific dataset from MongoDB.
+    Falls back to the 'default' document if no specific rule exists.
     """
-    return DATASET_POLICIES.get(filename, DEFAULT_DATASET_POLICY)
+    policy = _collection.find_one({"filename": filename}, {"_id": 0})
+    if policy is None:
+        policy = _collection.find_one({"filename": "default"}, {"_id": 0})
+    if policy is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No ABAC policy found in database.",
+        )
+    return policy
 
 
 def check_dataset_access(user_roles: list[str], filename: str) -> bool:

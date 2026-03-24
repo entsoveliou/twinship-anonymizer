@@ -1,6 +1,15 @@
 version: '3.8'
 
 services:
+  mongo:
+    build: ./mongo
+    container_name: mongo-datasetpolicies
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    restart: unless-stopped
+
   app:
     build: .
     container_name: encryption-api
@@ -22,4 +31,13 @@ services:
 
       # App Settings
       - POLL_INTERVAL=5
+
+      # MongoDB Configuration
+      - MONGO_URI=mongodb://root:rootpassword@mongo:27017
+      - MONGO_DB=datasetPolicies
+    depends_on:
+      - mongo
     restart: unless-stopped
+
+volumes:
+  mongo-data:

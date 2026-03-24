@@ -18,6 +18,10 @@ DESTINATION_BUCKET = os.getenv("DESTINATION_BUCKET", "encrypted-files")
 # --- App Configuration ---
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 5)) # Seconds
 
+# --- MongoDB Configuration ---
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://root:rootpassword@localhost:27017")
+MONGO_DB = os.getenv("MONGO_DB", "datasetPolicies")
+
 # --- JWT / Auth Configuration ---
 JWT_ALGORITHM = "RS256"
 
