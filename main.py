@@ -15,7 +15,7 @@ import settings
 import functions
 import crypto_utils
 from auth import get_roles, verify_token
-from abac import require_dataset_access, get_dataset_encryption_attributes
+from abac import require_dataset_access, get_dataset_encryption_attributes, check_dataset_access
 from policies_router import router as policies_router
 from prefix_policies_router import router as prefix_policies_router
 
@@ -210,12 +210,13 @@ async def verify_jwt(payload: dict = Depends(verify_token)):
 @app.get("/api/v1/listFiles")
 async def list_files(roles: list[str] = Depends(get_roles)):
     """
-    Returns a JSON array of all file names in the encrypted bucket.
-    Requires a valid JWT (no dataset-level ABAC).
+    Returns a JSON array of file names in the encrypted bucket
+    that the caller has ABAC access to.
     """
     try:
-        files = functions.list_files_in_encrypted_bucket()
-        return {"files": files, "count": len(files)}
+        all_files = functions.list_files_in_encrypted_bucket()
+        accessible = [f for f in all_files if check_dataset_access(roles, f)]
+        return {"files": accessible, "count": len(accessible)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
