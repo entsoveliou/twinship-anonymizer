@@ -70,6 +70,19 @@ def list_files_in_encrypted_bucket():
     return file_list
 
 
+def list_files_in_bucket(bucket_name):
+    """
+    Returns a list of filenames present in any given bucket.
+    """
+    client = get_minio_client()
+
+    if not client.bucket_exists(bucket_name):
+        return []
+
+    objects = client.list_objects(bucket_name, recursive=True)
+    return [obj.object_name for obj in objects]
+
+
 def download_file_from_encrypted_bucket(filename):
     """
     Downloads the raw bytes of a file from the encrypted bucket.

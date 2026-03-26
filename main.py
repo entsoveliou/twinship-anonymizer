@@ -210,13 +210,27 @@ async def verify_jwt(payload: dict = Depends(verify_token)):
 @app.get("/api/v1/listFiles")
 async def list_files(roles: list[str] = Depends(get_roles)):
     """
-    Returns a JSON array of file names in the encrypted bucket
-    that the caller has ABAC access to.
+    Returns a JSON array of all file names in the encrypted bucket.
+    Requires a valid JWT (no dataset-level ABAC).
     """
     try:
-        all_files = functions.list_files_in_encrypted_bucket()
+        files = functions.list_files_in_encrypted_bucket()
+        return {"files": files, "count": len(files)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/listFilesByBucket")
+async def list_files_by_bucket(bucket: str = Query(..., description="Name of the bucket to list files from"), roles: list[str] = Depends(get_roles)):
+    """
+    Returns a JSON array of all file names in the specified bucket.
+    Requires a valid JWT.
+    """
+    try:
+        all_files = functions.list_files_in_bucket(bucket)
         accessible = [f for f in all_files if check_dataset_access(roles, f)]
-        return {"files": accessible, "count": len(accessible)}
+        inaccessible = [f for f in all_files if not check_dataset_access(roles, f)]
+        return {"bucket": bucket, "accessible": accessible, "inaccessible": inaccessible}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
