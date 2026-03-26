@@ -6,16 +6,29 @@ import settings
 
 _client = MongoClient(settings.MONGO_URI)
 _collection = _client[settings.MONGO_DB]["policies"]
+_prefix_collection = _client[settings.MONGO_DB]["prefix_policies"]
 
 
 def get_dataset_policy(filename: str) -> dict:
     """
-    Returns the ABAC policy for a specific dataset from MongoDB.
-    Falls back to the 'default' document if no specific rule exists.
+    Returns the ABAC policy for a filename using a three-step lookup:
+      1. Exact match in 'policies' by filename
+      2. Prefix match in 'prefix_policies' (first matching prefix wins)
+      3. 'default' document in 'policies'
     """
+    # 1. Exact match
     policy = _collection.find_one({"filename": filename}, {"_id": 0})
-    if policy is None:
-        policy = _collection.find_one({"filename": "default"}, {"_id": 0})
+    if policy is not None:
+        return policy
+
+    # 2. Prefix match — fetch all prefix policies and check in Python
+    #    (prefix list is expected to be small)
+    for doc in _prefix_collection.find({}, {"_id": 0}):
+        if filename.startswith(doc["prefix"]):
+            return doc
+
+    # 3. Default fallback
+    policy = _collection.find_one({"filename": "default"}, {"_id": 0})
     if policy is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

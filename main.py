@@ -17,6 +17,7 @@ import crypto_utils
 from auth import get_roles, verify_token
 from abac import require_dataset_access, get_dataset_encryption_attributes
 from policies_router import router as policies_router
+from prefix_policies_router import router as prefix_policies_router
 
 # --- MinIO Client Setup (For Background Monitor) ---
 minio_client = Minio(
@@ -155,6 +156,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(policies_router)
+app.include_router(prefix_policies_router)
 
 
 # --- Dev Token Endpoint (development only) ---
