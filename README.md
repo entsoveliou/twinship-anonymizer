@@ -152,7 +152,44 @@ To interact with the encrypted files and test the ABE flow, users must authentic
   "token_type": "bearer",
   "expires_in": 3600
 }
-
+```
 ## Anonymizer
 
-_Documentation coming soon._
+The Anonymizer module acts as the core engine of the system. It runs continuous background tasks (cron-like functionalities) to automatically secure newly ingested data and enforce storage lifecycles. It also exposes the main APIs for clients to securely retrieve files based on their cryptographic attributes and access roles.
+
+### Background Tasks (Cron-like Functionalities)
+
+The module runs parallel asynchronous tasks in the background to manage the flow of data:
+
+#### 1. Continuous Encryption Monitor
+The anonymizer continuously monitors the designated source MinIO bucket for newly uploaded files. 
+- **Prefix Binding:** Files are expected to follow a specific naming convention using a prefix (e.g., `prefix_filename.csv`). 
+- **Automated Encryption:** When a new file is detected, the system extracts its prefix. This prefix corresponds to specific encryption attributes, which are ultimately bound to user roles via the ABAC policy. The file is immediately encrypted using AES-256-GCM and safely transferred to the encrypted destination bucket. 
+
+#### 2. Automated Retention Policy
+To ensure that raw, unencrypted data does not sit indefinitely in the source bucket, a strict retention policy runs constantly. It evaluates files based on their last edited timestamp and their prefix.
+
+This policy is configured upon startup using environment variables:
+- `RETENTION_PREFIX` *(default: `"weather"`)*: The background task will only target files starting with this specific prefix.
+- `RETENTION_SECONDS` *(default: `30`)*: The maximum amount of time (in seconds) a matching file is allowed to stay in the source bucket. Once the file's age exceeds this threshold, it is automatically and permanently deleted from the unencrypted bucket.
+
+---
+
+### REST API Endpoints
+
+The Anonymizer exposes the following protected APIs to interact with the encrypted data. All endpoints require a valid Bearer JWT.
+
+| Method | Endpoint | Parameters | Description | ABAC Enforcement |
+|--------|----------|------------|-------------|------------------|
+| **GET** | `/api/v1/listFiles` | None | Returns a JSON array of all file names currently stored in the encrypted bucket. | **None.** Requires a valid JWT, but no dataset-level policy check is performed to list the names. |
+| **GET** | `/api/v1/getUnencryptedFile` | `?filename=<string>` | Downloads the requested file, decrypts it on the fly using ABE, and returns the clean, readable content. | **Strict.** Checks the user's roles against the dataset's specific ABAC policy before allowing decryption. |
+| **GET** | `/api/v1/getEncryptedFile` | `?filename=<string>` | Downloads the requested file and returns it **AS IS** (still cryptographically scrambled). | **Strict.** Checks the user's roles against the dataset's specific ABAC policy before allowing the download. |
+
+---
+
+### API Documentation (Swagger UI)
+
+The Anonymizer is built with FastAPI, providing interactive, auto-generated documentation.
+
+For complete details on request parameters, expected responses, error codes, and to test the API endpoints interactively, please visit the Swagger UI at:  
+👉 **`http://<YOUR_SERVER_IP>:8000/docs#`**
