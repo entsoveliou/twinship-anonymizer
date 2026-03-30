@@ -124,9 +124,34 @@ The `default` policy (in `policies`) is protected — it cannot be deleted via t
 
 ## ABE — Attribute-Based Encryption
 
-_Documentation coming soon._
+The Attribute-Based Encryption (ABE) module ensures that data is cryptographically bound to specific attributes. Instead of relying solely on API-level checks, the file's ciphertext is tied to `encryption_attributes` (acting as Associated Authenticated Data - AAD in AES-256-GCM). 
 
----
+If a user does not possess the correct roles to retrieve a dataset's attributes, or if the attributes are tampered with, the decryption process will mathematically fail.
+
+### Development Token Issuance (`/api/v1/dev/token`)
+
+To interact with the encrypted files and test the ABE flow, users must authenticate using a JWT. For development and testing purposes, a dedicated endpoint is provided to easily generate signed JWTs with custom roles.
+
+**Method:** `POST`  
+**Endpoint:** `/api/v1/dev/token`
+
+#### Query Parameters
+
+| Name | Type | Description | Default Value |
+|------|------|-------------|---------------|
+| `sub` | string | Subject (User ID) | `dev-user` |
+| `preferred_username` | string | Username | `developer` |
+| `roles` | string | Comma-separated list of roles | `default-roles-twinship, offline_access, developer, uma_authorization, operator` |
+| `expires_in` | integer | Token lifetime in seconds | `3600` |
+
+#### Example Response
+
+```json
+{
+  "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "bearer",
+  "expires_in": 3600
+}
 
 ## Anonymizer
 
