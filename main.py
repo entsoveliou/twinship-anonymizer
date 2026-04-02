@@ -229,8 +229,7 @@ async def list_files_by_bucket(bucket: str = Query(..., description="Name of the
     try:
         all_files = functions.list_files_in_bucket(bucket)
         accessible = [f for f in all_files if check_dataset_access(roles, f)]
-        inaccessible = [f for f in all_files if not check_dataset_access(roles, f)]
-        return {"bucket": bucket, "accessible": accessible, "inaccessible": inaccessible}
+        return {"bucket": bucket, "files": accessible, "count": len(accessible)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
