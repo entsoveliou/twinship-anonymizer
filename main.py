@@ -7,6 +7,7 @@ from minio.error import S3Error
 import asyncio
 import io
 import jwt
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -14,10 +15,12 @@ from typing import Optional
 import settings
 import functions
 import crypto_utils
-from auth import get_roles, verify_token
-from abac import require_dataset_access, get_dataset_encryption_attributes, check_dataset_access
+import keys
+import audit
+from auth import get_organizations, get_caller, verify_token
+from abac import require_dataset_access, get_org_access, check_dataset_access
 from policies_router import router as policies_router
-from prefix_policies_router import router as prefix_policies_router
+from audit_router import router as audit_router
 
 # --- MinIO Client Setup (For Background Monitor) ---
 minio_client = Minio(
@@ -40,7 +43,7 @@ def check_if_exists_in_destination(object_name):
         return False
 
 
-def process_file(object_name):
+def process_file(object_name) -> bool:
     try:
         print(f"\n--- [PROCESSING]: {object_name} ---")
         response = minio_client.get_object(settings.SOURCE_BUCKET, object_name)
@@ -49,10 +52,12 @@ def process_file(object_name):
         response.release_conn()
 
         # Encrypt and Upload (logic is in functions.py)
-        functions.upload_to_encrypted_bucket(object_name, content_bytes)
-        print("-------------------------------------------\n")
+        return functions.upload_to_encrypted_bucket(object_name, content_bytes)
     except Exception as e:
         print(f"Error processing file {object_name}: {e}")
+        return False
+    finally:
+        print("-------------------------------------------\n")
 
 
 def sync_existing_files():
@@ -78,64 +83,69 @@ async def monitor_bucket():
         try:
             objects = await asyncio.to_thread(minio_client.list_objects, settings.SOURCE_BUCKET)
             for obj in list(objects):
-                if obj.object_name not in processed_files:
-                    # Double check logic
-                    exists = await asyncio.to_thread(check_if_exists_in_destination, obj.object_name)
-                    processed_files.add(obj.object_name)
+                name = obj.object_name
+                if name in processed_files:
+                    # Already safely encrypted (this run or a previous one, e.g.
+                    # a crash between upload and delete) — the raw copy's job
+                    # is done.
+                    await asyncio.to_thread(functions.delete_source_file, name)
+                    continue
 
-                    if not exists:
-                        await asyncio.to_thread(process_file, obj.object_name)
+                exists = await asyncio.to_thread(check_if_exists_in_destination, name)
+                if exists:
+                    processed_files.add(name)
+                    await asyncio.to_thread(functions.delete_source_file, name)
+                else:
+                    success = await asyncio.to_thread(process_file, name)
+                    if success:
+                        processed_files.add(name)
+                        await asyncio.to_thread(functions.delete_source_file, name)
+                    # else: no policy yet (or a transient error) — leave the
+                    # raw file in place, it'll be retried on the next poll.
         except Exception as e:
             print(f"Monitor Error: {e}")
         await asyncio.sleep(settings.POLL_INTERVAL)
 
 
-# --- NEW: Background Task Logic (Retention Policy) ---
+# --- Background Task Logic (Unpolicied-File Cleanup) ---
 
-async def enforce_retention_policy():
+async def cleanup_unpolicied_files():
     """
-    Parallel background task that checks the SOURCE_BUCKET for files starting
-    with RETENTION_PREFIX. If they are older than RETENTION_SECONDS, it deletes them.
+    Parallel background task that deletes files from SOURCE_BUCKET that have
+    sat with no matching ABAC policy for longer than POLICY_GRACE_SECONDS.
+    Files that do have a policy are encrypted and removed by monitor_bucket
+    itself, long before this would ever consider them — this only cleans up
+    genuinely orphaned uploads (no policy ever created for them).
     """
     print(
-        f"Starting retention policy monitor on bucket '{settings.SOURCE_BUCKET}' for prefix '{settings.RETENTION_PREFIX}'...")
+        f"Starting unpolicied-file cleanup on bucket '{settings.SOURCE_BUCKET}' "
+        f"(grace period: {settings.POLICY_GRACE_SECONDS}s)...")
 
     while True:
         try:
             if minio_client.bucket_exists(settings.SOURCE_BUCKET):
-                # We can filter directly by prefix using the MinIO client
-                objects = await asyncio.to_thread(
-                    minio_client.list_objects,
-                    settings.SOURCE_BUCKET,
-                    prefix=settings.RETENTION_PREFIX
-                )
+                objects = await asyncio.to_thread(minio_client.list_objects, settings.SOURCE_BUCKET)
 
                 # MinIO returns last_modified in UTC, so we compare against UTC now
                 now = datetime.now(timezone.utc)
 
                 for obj in list(objects):
-                    # Calculate how old the file is in seconds
+                    if obj.object_name in processed_files:
+                        # Has (or will shortly have) an encrypted copy —
+                        # monitor_bucket owns cleaning this one up.
+                        continue
+
                     age_in_seconds = (now - obj.last_modified).total_seconds()
 
-                    if age_in_seconds > settings.RETENTION_SECONDS:
+                    if age_in_seconds > settings.POLICY_GRACE_SECONDS:
                         print(
-                            f"[RETENTION] Deleting '{obj.object_name}' from source bucket (Age: {age_in_seconds:.1f}s > Limit: {settings.RETENTION_SECONDS}s)")
-
-                        # Remove from MinIO
+                            f"[CLEANUP] Deleting '{obj.object_name}' — no ABAC policy found "
+                            f"within {settings.POLICY_GRACE_SECONDS}s (Age: {age_in_seconds:.1f}s)")
                         await asyncio.to_thread(minio_client.remove_object, settings.SOURCE_BUCKET, obj.object_name)
 
-                        # Clean up our memory set so we don't leak memory over time
-                        if obj.object_name in processed_files:
-                            processed_files.remove(obj.object_name)
-
-                        # NOTE: This only deletes from the SOURCE bucket.
-                        # If you also want to delete the encrypted copy from the
-                        # DESTINATION bucket, you would add another remove_object call here.
-
         except Exception as e:
-            print(f"Retention Monitor Error: {e}")
+            print(f"Cleanup Monitor Error: {e}")
 
-        # Poll at the same interval as the monitor, or you can create a separate variable
         await asyncio.sleep(settings.POLL_INTERVAL)
 
 
@@ -145,18 +155,18 @@ async def enforce_retention_policy():
 async def lifespan(app: FastAPI):
     # Start BOTH tasks concurrently
     task_monitor = asyncio.create_task(monitor_bucket())
-    task_retention = asyncio.create_task(enforce_retention_policy())
+    task_cleanup = asyncio.create_task(cleanup_unpolicied_files())
 
     yield
 
     # Cancel both tasks on shutdown
     task_monitor.cancel()
-    task_retention.cancel()
+    task_cleanup.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(policies_router)
-app.include_router(prefix_policies_router)
+app.include_router(audit_router)
 
 
 # --- Dev Token Endpoint (development only) ---
@@ -165,32 +175,77 @@ app.include_router(prefix_policies_router)
 async def issue_dev_token(
         sub: str = Query("dev-user", description="Subject (user id)"),
         preferred_username: str = Query("developer", description="Username"),
-        roles: str = Query(
-            "default-roles-twinship,offline_access,developer,uma_authorization,operator",
-            description="Comma-separated list of roles",
+        email: str = Query("developer@example.com", description="Email claim"),
+        organizations: str = Query(
+            "UBI:admin",
+            description="Comma-separated organizationId:access pairs, e.g. 'UBI:admin,WAR:c-ro'",
         ),
+        realm: str = Query("twinship", description="Realm name, shapes the 'iss' claim and default realm roles"),
         expires_in: int = Query(3600, description="Token lifetime in seconds"),
 ):
     """
-    DEV ONLY — Issues a signed JWT using the local dev private key.
-    This endpoint should be disabled or removed in production.
+    DEV ONLY — mints an RS256 JWT shaped like a real Keycloak access token
+    (standard claims: iss/aud/azp/session_state/realm_access/resource_access/
+    scope/email/etc.) on top of the 'organizations' claim, signed with the
+    local dev private key. This endpoint 501s if no private key is
+    configured, which is the production posture — a partner Keycloak issues
+    real tokens instead, and only JWT_PUBLIC_KEY needs to change to verify
+    them; the claim shape this app actually reads ('organizations') is
+    identical either way. Every other claim here is cosmetic realism, not
+    used for any authorization decision in this app.
     """
     if not settings.JWT_PRIVATE_KEY:
         raise HTTPException(status_code=501, detail="No private key configured. This endpoint is for development only.")
 
+    org_grants = []
+    for pair in organizations.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        org_id, _, access = pair.partition(":")
+        org_grants.append({"organizationId": org_id.strip(), "access": (access or "c-ro").strip()})
+
     now = datetime.now(timezone.utc)
+    session_id = str(uuid.uuid4())
+
     payload = {
-        "sub": sub,
-        "preferred_username": preferred_username,
-        "roles": [r.strip() for r in roles.split(",")],
-        "realm_access": {
-            "roles": [r.strip() for r in roles.split(",")]
-        },
-        "iat": now,
         "exp": now + timedelta(seconds=expires_in),
-        "iss": "dev-issuer",
+        "iat": now,
+        # auth_time isn't one of PyJWT's auto-converted datetime fields
+        # (only exp/iat/nbf are) — needs an explicit Unix timestamp.
+        "auth_time": int(now.timestamp()),
+        "jti": str(uuid.uuid4()),
+        "iss": f"http://localhost:8080/realms/{realm}",
+        "aud": "account",
+        "sub": sub,
+        "typ": "Bearer",
+        "azp": "twinship-anonymizer",
+        "sid": session_id,
+        "session_state": session_id,
+        "acr": "1",
+        "allowed-origins": ["*"],
+        "realm_access": {
+            "roles": [f"default-roles-{realm}", "offline_access", "uma_authorization"]
+        },
+        "resource_access": {
+            "account": {"roles": ["manage-account", "manage-account-links", "view-profile"]}
+        },
+        "scope": "openid profile email",
+        "email_verified": True,
+        "name": preferred_username,
+        "preferred_username": preferred_username,
+        "given_name": preferred_username,
+        "family_name": "",
+        "email": email,
+        # The only claim this app actually authorizes against:
+        "organizations": org_grants,
     }
-    token = jwt.encode(payload, settings.JWT_PRIVATE_KEY, algorithm=settings.JWT_ALGORITHM)
+    token = jwt.encode(
+        payload,
+        settings.JWT_PRIVATE_KEY,
+        algorithm=settings.JWT_ALGORITHM,
+        headers={"kid": "dev-key-1", "typ": "JWT"},
+    )
     return {"access_token": token, "token_type": "bearer", "expires_in": expires_in}
 
 
@@ -208,55 +263,77 @@ async def verify_jwt(payload: dict = Depends(verify_token)):
 
 
 @app.get("/api/v1/listFiles")
-async def list_files(roles: list[str] = Depends(get_roles)):
+async def list_files(orgs: list[dict] = Depends(get_organizations)):
     """
-    Returns a JSON array of all file names in the encrypted bucket.
-    Requires a valid JWT (no dataset-level ABAC).
+    Returns a JSON array of file names in the encrypted bucket, filtered to
+    those the caller's claimed tier meets or exceeds their org's policy grant on.
     """
     try:
-        files = functions.list_files_in_encrypted_bucket()
-        return {"files": files, "count": len(files)}
+        all_files = functions.list_files_in_encrypted_bucket()
+        accessible = [f for f in all_files if check_dataset_access(orgs, f)]
+        return {"files": accessible, "count": len(accessible)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/v1/listFilesByBucket")
-async def list_files_by_bucket(bucket: str = Query(..., description="Name of the bucket to list files from"), roles: list[str] = Depends(get_roles)):
+async def list_files_by_bucket(bucket: str = Query(..., description="Name of the bucket to list files from"), orgs: list[dict] = Depends(get_organizations)):
     """
-    Returns a JSON array of all file names in the specified bucket.
-    Requires a valid JWT.
+    Returns a JSON array of all file names in the specified bucket, filtered
+    to those the caller's claimed tier meets or exceeds their org's policy grant on.
     """
     try:
         all_files = functions.list_files_in_bucket(bucket)
-        accessible = [f for f in all_files if check_dataset_access(roles, f)]
+        accessible = [f for f in all_files if check_dataset_access(orgs, f)]
         return {"bucket": bucket, "files": accessible, "count": len(accessible)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/v1/getUnencryptedFile")
-async def get_unencrypted_file(filename: str, roles: list[str] = Depends(get_roles)):
+def get_unencrypted_file(filename: str, caller: dict = Depends(get_caller)):
     """
     Downloads the file, decrypts it, and returns the clean content.
-    Dataset ABAC: checks the user's roles against the dataset's policy.
+    Dataset ABAC: the caller must have an org where their own claimed tier
+    meets or exceeds what the policy granted that org — no separate
+    hardcoded floor. The matched org's policy-recorded tier is then used to
+    unwrap that org's copy of the DEK (the tier it was wrapped with).
+    Every attempt (success or failure) is written to the access audit log.
     """
+    org_ids = caller["org_ids"]
+
+    def _log(status: str, reason: str = None):
+        audit.log_access(caller["user_id"], caller["username"], org_ids, filename, "getUnencryptedFile", status, reason)
+
     try:
-        # 1. Check dataset-level ABAC (raises 403 if denied)
-        require_dataset_access(filename, roles)
+        # 1. Check dataset-level ABAC (raises 404/403 if denied); returns the
+        #    caller's best-matching organization on this dataset.
+        matched_org = require_dataset_access(filename, caller["organizations"])
 
         # 2. Download raw encrypted bytes from MinIO
         encrypted_bytes = functions.download_file_from_encrypted_bucket(filename)
 
-        # 3. Get the encryption attributes for this dataset from the policy
-        encryption_attributes = get_dataset_encryption_attributes(filename)
+        # 3. Unwrap that organization's copy of the DEK, using the tier
+        #    recorded in the POLICY (not the caller's claimed tier) — that's
+        #    what it was wrapped with at encryption time.
+        access = get_org_access(filename, matched_org)
+        wrapped = keys.get_wrapped_key(filename, matched_org)
+        if wrapped is None:
+            raise HTTPException(status_code=500, detail="No wrapped key found for this organization/dataset.")
 
-        # 4. Decrypt
-        decrypted_bytes = crypto_utils.decrypt_data(encrypted_bytes, encryption_attributes)
+        aad = filename.encode()
+        kek = keys.get_org_tier_key(matched_org, access)
+        dek = crypto_utils.unwrap_key(kek, wrapped["wrapped_dek"], aad)
+        if dek is None:
+            raise HTTPException(status_code=403, detail="Decryption Failed: Invalid attributes or corrupted key.")
 
+        # 4. Decrypt the file content
+        decrypted_bytes = crypto_utils.decrypt_content(encrypted_bytes, dek, aad)
         if decrypted_bytes is None:
             raise HTTPException(status_code=403, detail="Decryption Failed: Invalid attributes or corrupted data.")
 
         # 5. Return as a file download
+        _log("success")
         return Response(
             content=decrypted_bytes,
             media_type="application/octet-stream",
@@ -264,26 +341,40 @@ async def get_unencrypted_file(filename: str, roles: list[str] = Depends(get_rol
         )
 
     except S3Error:
+        _log("failure", "File not found in encrypted bucket")
         raise HTTPException(status_code=404, detail="File not found in encrypted bucket")
+    except HTTPException as e:
+        _log("failure", str(e.detail))
+        raise
     except Exception as e:
-        if isinstance(e, HTTPException): raise e
+        _log("failure", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/v1/getEncryptedFile")
-async def get_encrypted_file(filename: str, roles: list[str] = Depends(get_roles)):
+def get_encrypted_file(filename: str, caller: dict = Depends(get_caller)):
     """
-    Downloads the file and returns it AS IS (still encrypted).
-    Dataset ABAC: checks the user's roles against the dataset's policy.
+    Downloads the file and returns it AS IS (still encrypted) — mainly a way
+    to confirm encryption actually happened. Access requirement is identical
+    to getUnencryptedFile (same require_dataset_access call, no lower bar):
+    this endpoint isn't a separate "ciphertext only" grant, it's a
+    diagnostic view for callers who already qualify for real read access.
+    Every attempt (success or failure) is written to the access audit log.
     """
+    org_ids = caller["org_ids"]
+
+    def _log(status: str, reason: str = None):
+        audit.log_access(caller["user_id"], caller["username"], org_ids, filename, "getEncryptedFile", status, reason)
+
     try:
-        # 1. Check dataset-level ABAC (raises 403 if denied)
-        require_dataset_access(filename, roles)
+        # 1. Check dataset-level ABAC (raises 404/403 if denied)
+        require_dataset_access(filename, caller["organizations"])
 
         # 2. Download raw encrypted bytes from MinIO
         encrypted_bytes = functions.download_file_from_encrypted_bucket(filename)
 
         # 3. Return directly without decryption
+        _log("success")
         return Response(
             content=encrypted_bytes,
             media_type="application/octet-stream",
@@ -291,9 +382,13 @@ async def get_encrypted_file(filename: str, roles: list[str] = Depends(get_roles
         )
 
     except S3Error:
+        _log("failure", "File not found in encrypted bucket")
         raise HTTPException(status_code=404, detail="File not found in encrypted bucket")
+    except HTTPException as e:
+        _log("failure", str(e.detail))
+        raise
     except Exception as e:
-        if isinstance(e, HTTPException): raise e
+        _log("failure", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 

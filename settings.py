@@ -6,10 +6,11 @@ import os
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio-api.vessel-ai.eu")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
-RETENTION_SECONDS = os.getenv("RETENTION_SECONDS", 30)
-RETENTION_PREFIX = os.getenv("RETENTION_PREFIX", "weather")
-# Set to True for HTTPS
-MINIO_SECURE = True
+# How long a file may sit in SOURCE_BUCKET with no matching ABAC policy
+# before it's deleted as orphaned (see cleanup_unpolicied_files in main.py).
+POLICY_GRACE_SECONDS = int(os.getenv("POLICY_GRACE_SECONDS", 60))
+# Set MINIO_SECURE=false for HTTP-only MinIO deployments (e.g. local/dev)
+MINIO_SECURE = os.getenv("MINIO_SECURE", "true").strip().lower() in ("1", "true", "yes")
 
 # --- Bucket Settings ---
 SOURCE_BUCKET = os.getenv("SOURCE_BUCKET", "demo-data")
@@ -37,6 +38,16 @@ try:
 except FileNotFoundError:
     pass
 
-JWT_PUBLIC_KEY = os.getenv("JWT_PUBLIC_KEY", _default_public_key)
+def _normalize_pem(value: str) -> str:
+    # .env files can't hold real newlines, so PEM values are commonly passed
+    # with literal "\n" escapes. A real PEM never contains that literal
+    # two-character sequence otherwise, so unescaping it is always safe.
+    return value.replace("\\n", "\n") if value else value
+
+
+# `or` (not getenv's default arg) so an env var present-but-blank — e.g. from
+# an env_file line like "JWT_PUBLIC_KEY=" — still falls back to the dev key,
+# instead of silently becoming an empty, unusable key.
+JWT_PUBLIC_KEY = _normalize_pem(os.getenv("JWT_PUBLIC_KEY") or _default_public_key)
 # Private key is ONLY used by the dev token endpoint — never in production
-JWT_PRIVATE_KEY = os.getenv("JWT_PRIVATE_KEY", _default_private_key)
+JWT_PRIVATE_KEY = _normalize_pem(os.getenv("JWT_PRIVATE_KEY") or _default_private_key)

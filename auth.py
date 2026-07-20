@@ -35,14 +35,24 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
         )
 
 
-def get_roles(payload: dict = Depends(verify_token)) -> list[str]:
+def get_organizations(payload: dict = Depends(verify_token)) -> list[dict]:
     """
-    Extracts the roles list from the decoded token.
-    Supports Keycloak's nested realm_access.roles and a flat 'roles' claim.
+    Extracts the caller's organization grants from the token:
+    [{"organizationId": "UBI", "access": "admin"}, ...]
     """
-    # Keycloak standard location
-    roles = payload.get("realm_access", {}).get("roles")
-    if roles is None:
-        # Fallback: flat 'roles' claim (used by dev token endpoint)
-        roles = payload.get("roles", [])
-    return roles
+    return payload.get("organizations", [])
+
+
+def get_caller(payload: dict = Depends(verify_token)) -> dict:
+    """
+    Extracts the caller's identity for audit logging: who they are, plus
+    their organization grants in both the full and id-only forms callers
+    typically need.
+    """
+    organizations = payload.get("organizations", [])
+    return {
+        "user_id": payload.get("sub", "unknown"),
+        "username": payload.get("preferred_username", ""),
+        "organizations": organizations,
+        "org_ids": [o["organizationId"] for o in organizations],
+    }

@@ -1,59 +1,35 @@
 db = db.getSiblingDB('datasetPolicies');
 
-// --- Exact-filename policies ---
+// --- Scoped application user ---
+// The app connects as this user, not the bootstrap root account created via
+// MONGO_INITDB_ROOT_USERNAME/PASSWORD. readWrite on this one database only —
+// no admin/root privileges, so a leaked MONGO_URI can't do anything outside
+// datasetPolicies (create other users, touch other databases, etc.).
+db.createUser({
+    user: "app",
+    pwd: "app_change_me_internal",
+    roles: [{ role: "readWrite", db: "datasetPolicies" }]
+});
+
+// --- Dataset policies (one document per dataset, no fallback) ---
 db.createCollection('policies');
-db.policies.createIndex({ filename: 1 }, { unique: true });
+db.policies.createIndex({ dataset_name: 1 }, { unique: true });
 
-// --- Prefix-based policies ---
-db.createCollection('prefix_policies');
-db.prefix_policies.createIndex({ prefix: 1 }, { unique: true });
+// --- Auto-provisioned per-organization root secrets ---
+db.createCollection('org_secrets');
+db.org_secrets.createIndex({ organizationId: 1 }, { unique: true });
 
-db.prefix_policies.insertMany([
-    {
-        prefix: "vodafone",
-        required_roles: ["developer", "operator"],
-        match: "any",
-        encryption_attributes: ["itsec", "csirt"]
-    },
-    {
-        prefix: "motorola",
-        required_roles: ["itsec", "csirt", "admin"],
-        match: "any",
-        encryption_attributes: ["itsec", "csirt"]
-    },
-    {
-        prefix: "nokia",
-        required_roles: ["itsec", "admin"],
-        match: "any",
-        encryption_attributes: [ "csirt"]
-    }
-    
+// --- Per-dataset wrapped DEKs (one entry per granted organization) ---
+db.createCollection('dataset_keys');
+db.dataset_keys.createIndex({ dataset_name: 1 }, { unique: true });
 
-]);
+// --- Access audit log (getEncryptedFile / getUnencryptedFile attempts) ---
+db.createCollection('access_logs');
+db.access_logs.createIndex({ user_id: 1 });
+db.access_logs.createIndex({ organizations: 1 });
+db.access_logs.createIndex({ dataset_name: 1 });
+db.access_logs.createIndex({ timestamp: -1 });
 
-db.policies.insertMany([
-    {
-        filename: "default",
-        required_roles: ["developer", "operator"],
-        match: "all",
-        encryption_attributes: ["itsec", "csirt", "euisac"]
-    },
-    {
-        filename: "dataset1.pdf",
-        required_roles: ["itsec", "csirt", "admin"],
-        match: "all",
-        encryption_attributes: ["itsec", "csirt", "euisac"]
-    },
-    {
-        filename: "dataset2.pdf",
-        required_roles: ["itsec", "admin"],
-        match: "any",
-        encryption_attributes: ["itsec", "csirt"]
-    },
-    {
-        filename: "dataset3.pdf",
-        required_roles: ["csirt", "admin"],
-        match: "any",
-        encryption_attributes: ["csirt", "euisac"]
-    }
-]);
+// No seed policies on purpose: every dataset needs an explicit policy
+// created via POST /api/v1/policies before its file is uploaded. There is
+// no fallback/default policy in this system.

@@ -1,11 +1,12 @@
-version: '3.8'
-
 services:
   mongo:
     build: ./mongo
     container_name: mongo-datasetpolicies
-    ports:
-      - "27017:27017"
+    # Root creds are baked into mongo/Dockerfile — internal only, never
+    # partner-configurable, so not sourced from .env.
+    # No "ports:" mapping on purpose — the app reaches this over the internal
+    # Docker network (mongo:27017); nothing outside the compose network,
+    # including the host itself, needs to reach Mongo directly.
     volumes:
       - mongo-data:/data/db
     restart: unless-stopped
@@ -13,28 +14,16 @@ services:
   app:
     build: .
     container_name: encryption-api
+    env_file:
+      - .env
+    environment:
+      # Internal wiring to the bundled mongo service (must match mongo/init/01-init.js).
+      # Connects as the scoped "app" user (readWrite on datasetPolicies only),
+      # not the bootstrap root account — not partner-facing, kept out of .env.
+      - MONGO_URI=mongodb://app:app_change_me_internal@mongo:27017/datasetPolicies
+      - MONGO_DB=datasetPolicies
     ports:
       - "8000:8000"
-    environment:
-      # MinIO Configuration
-      - MINIO_ENDPOINT=minio-api.vessel-ai.eu
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin123
-      # Set to True for HTTPS, False for HTTP
-      - MINIO_SECURE=True
-      - RETENTION_SECONDS=30
-      - RETENTION_PREFIX=weather
-
-      # Bucket Configuration
-      - SOURCE_BUCKET=demo-data
-      - DESTINATION_BUCKET=encrypted-files
-
-      # App Settings
-      - POLL_INTERVAL=5
-
-      # MongoDB Configuration
-      - MONGO_URI=mongodb://root:rootpassword@mongo:27017
-      - MONGO_DB=datasetPolicies
     depends_on:
       - mongo
     restart: unless-stopped
