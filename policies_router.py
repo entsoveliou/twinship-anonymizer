@@ -36,6 +36,35 @@ class PolicyOut(PolicyIn):
     created_at: datetime
 
 
+class PolicyByUserTypeIn(BaseModel):
+    dataset_name: str
+    user_types: list[str]
+
+    @field_validator("user_types")
+    @classmethod
+    def non_empty_list(cls, v):
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+
+# Consortium "User-Role Type" -> granular resource roles it composites in
+# Keycloak. Lets policies be created by type name instead of hand-typing the
+# granular roles; the stored policy document is identical either way (a
+# plain `policy.roles` list of granular strings) — nothing downstream needs
+# to know this mapping exists.
+USER_ROLE_TYPE_ROLES = {
+    "UserGR": ["data-gr", "model-gr", "apps"],
+    "UserST": ["data-st", "model-st", "apps"],
+    "UserSL": ["data-sl", "model-sl", "apps"],
+    "UserDM": ["data-gr", "data-st", "data-sl", "model-gr", "model-st"],
+    "UserMA": ["model-gr", "model-st", "model-sl", "apps"],
+    "UserAA": ["apps"],
+    "UserDD": ["data-gr", "data-st", "data-sl"],
+    "UserSU": ["data-gr", "data-st", "data-sl", "model-gr", "model-st", "model-sl", "apps"],
+}
+
+
 # --- Auth ---
 
 def _require_role_overlap(caller_roles: list[str], required_roles: list[str], dataset_name: str):
@@ -146,6 +175,38 @@ def create_policy(policy: PolicyIn, caller: dict = Depends(get_caller)):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=reason)
     _log("success")
     return _to_out(doc)
+
+
+@router.post(
+    "/by-user-type",
+    response_model=PolicyOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_policy_by_user_type(body: PolicyByUserTypeIn, caller: dict = Depends(get_caller)):
+    """
+    Convenience creation path: specify consortium User-Role Type names
+    (UserGR, UserSU, ...) instead of hand-typing granular roles. Expanded
+    into the equivalent granular roles (deduped) via USER_ROLE_TYPE_ROLES,
+    then created exactly like a normal policy through create_policy — same
+    role-overlap check, same audit logging, same stored document shape.
+    """
+    def _log(result_status: str, reason: str = None):
+        audit.log_access(
+            caller["user_id"], caller["username"], caller["roles"],
+            body.dataset_name, "create_policy", result_status, reason,
+        )
+
+    unknown = [t for t in body.user_types if t not in USER_ROLE_TYPE_ROLES]
+    if unknown:
+        reason = f"Unknown user type(s): {unknown}. Known types: {list(USER_ROLE_TYPE_ROLES)}"
+        _log("failure", reason)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=reason)
+
+    expanded_roles = list(dict.fromkeys(
+        role for user_type in body.user_types for role in USER_ROLE_TYPE_ROLES[user_type]
+    ))
+    policy = PolicyIn(dataset_name=body.dataset_name, policy=PolicyBody(roles=expanded_roles))
+    return create_policy(policy, caller)
 
 
 @router.put(

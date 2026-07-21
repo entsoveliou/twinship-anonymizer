@@ -94,11 +94,24 @@ This check is identical for every endpoint that enforces ABAC — `getEncryptedF
 | GET | `/api/v1/policies/` | List all policies | Valid JWT |
 | GET | `/api/v1/policies/{dataset_name}` | Get a single policy | Valid JWT |
 | POST | `/api/v1/policies/` | Create a policy | Caller must hold at least one of the roles being granted in the new policy |
+| POST | `/api/v1/policies/by-user-type` | Create a policy from consortium User-Role Type names instead of granular roles (see below) | Same as above, checked against the expanded granular roles |
 | PUT | `/api/v1/policies/{dataset_name}` | Replace a policy entirely | Caller must hold at least one role the *existing* policy already grants |
 | PATCH | `/api/v1/policies/{dataset_name}` | Partially update a policy | Caller must hold at least one role the *existing* policy already grants |
 | DELETE | `/api/v1/policies/{dataset_name}` | Delete a policy | Caller must hold at least one role the *existing* policy already grants |
 
 There's no dedicated platform-admin concept — any role holder on a dataset can manage its policy, not just whoever originally created it. Tighten this if that's too permissive.
+
+#### Creating a policy by User-Role Type
+
+Instead of hand-typing granular roles, `POST /api/v1/policies/by-user-type` accepts consortium "User-Role Type" names and expands them into the equivalent granular roles automatically:
+
+```json
+{"dataset_name": "grimaldi_data", "user_types": ["UserGR", "UserDM"]}
+```
+
+expands to a stored policy of `{"roles": ["data-gr", "model-gr", "apps", "data-st", "data-sl", "model-st"]}` (deduplicated) — identical in shape and behavior to a policy created with granular roles directly; nothing downstream can tell the difference. `PUT`/`PATCH` don't have a by-user-type equivalent yet, only creation.
+
+Recognized types: `UserGR`, `UserST`, `UserSL`, `UserDM`, `UserMA`, `UserAA`, `UserDD`, `UserSU`.
 
 ---
 
