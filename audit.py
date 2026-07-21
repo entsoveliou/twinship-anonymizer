@@ -13,14 +13,14 @@ _access_logs = _client[settings.MONGO_DB]["access_logs"]
 def log_access(
     user_id: str,
     username: str,
-    organizations: list[str],
+    roles: list[str],
     dataset_name: str,
     operation: str,
     status: str,
     reason: Optional[str] = None,
 ):
     """
-    Records one access attempt: who (user_id/username/organizations), what
+    Records one access attempt: who (user_id/username/roles), what
     (dataset_name/operation), and the outcome (status: "success"/"failure",
     with an optional reason for failures).
     """
@@ -28,7 +28,7 @@ def log_access(
         "timestamp": datetime.now(timezone.utc),
         "user_id": user_id,
         "username": username,
-        "organizations": organizations,
+        "roles": roles,
         "dataset_name": dataset_name,
         "operation": operation,
         "status": status,
@@ -40,7 +40,7 @@ def log_access(
 
 def query_access_logs(
     user_id: Optional[str] = None,
-    organization: Optional[str] = None,
+    role: Optional[str] = None,
     dataset_name: Optional[str] = None,
     status: Optional[str] = None,
     limit: int = 100,
@@ -49,9 +49,9 @@ def query_access_logs(
     query = {}
     if user_id:
         query["user_id"] = user_id
-    if organization:
-        # organizations is stored as an array; this matches if the value is a member
-        query["organizations"] = organization
+    if role:
+        # roles is stored as an array; this matches if the value is a member
+        query["roles"] = role
     if dataset_name:
         query["dataset_name"] = dataset_name
     if status:

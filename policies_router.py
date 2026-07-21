@@ -1,6 +1,5 @@
 # policies_router.py
 from datetime import datetime, timezone
-from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
@@ -16,48 +15,45 @@ router = APIRouter(prefix="/api/v1/policies", tags=["policies"])
 
 # --- Schemas ---
 
-class RoleGrant(BaseModel):
-    organizationId: str
-    access: Literal["admin", "rw", "ro", "c-ro"]
-
-
 class PolicyBody(BaseModel):
-    roles: list[RoleGrant]
+    roles: list[str]
 
     @field_validator("roles")
     @classmethod
     def non_empty_list(cls, v):
         if not v:
             raise ValueError("must not be empty")
-        return v
+        return list(dict.fromkeys(v))  # de-dup, preserve order
 
 
 class PolicyIn(BaseModel):
     dataset_name: str
-    owner: str
     policy: PolicyBody
 
 
 class PolicyOut(PolicyIn):
+    owner: str
     created_at: datetime
 
 
 # --- Auth ---
 
-def require_policy_write_access(caller: dict = Depends(get_caller)) -> dict:
+def _require_role_overlap(caller_roles: list[str], required_roles: list[str], dataset_name: str):
     """
-    Managing policies requires admin or rw access on at least one
-    organization. This is a coarse starting gate; tighten to a dedicated
-    platform-admin org/claim once that concept exists. Also doubles as the
-    identity source for audit-logging policy writes, since it already
-    resolves the caller.
+    Managing a dataset's policy requires holding at least one role that
+    policy already grants (for create, before one exists yet, "already
+    grants" means the roles being requested in the new policy body). No
+    dedicated platform-admin concept — any role holder on a dataset can
+    manage its policy.
     """
-    if not any(o.get("access") in ("admin", "rw") for o in caller["organizations"]):
+    if not any(r in required_roles for r in caller_roles):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Requires admin or rw access to manage policies.",
+            detail=(
+                f"Access denied for dataset '{dataset_name}'. "
+                f"Requires one of: {required_roles}. Your roles: {caller_roles}"
+            ),
         )
-    return caller
 
 
 # --- Helpers ---
@@ -77,7 +73,7 @@ def _not_found(dataset_name: str):
 def _roles_set(doc: dict | None) -> set:
     if not doc:
         return set()
-    return {(r["organizationId"], r["access"]) for r in doc["policy"]["roles"]}
+    return set(doc["policy"]["roles"])
 
 
 def _reencrypt_if_changed(dataset_name: str, old_doc: dict | None, new_doc: dict):
@@ -85,7 +81,7 @@ def _reencrypt_if_changed(dataset_name: str, old_doc: dict | None, new_doc: dict
     If this update actually changed the role grants, and the dataset is
     already encrypted, transparently re-encrypt it against the new policy
     (fresh DEK, re-wrapped for the current roles) so getUnencryptedFile
-    doesn't break for added/changed orgs. No-op if roles are unchanged or
+    doesn't break for added/changed roles. No-op if roles are unchanged or
     the dataset was never encrypted yet.
     """
     if _roles_set(old_doc) == _roles_set(new_doc):
@@ -125,15 +121,22 @@ def get_policy(dataset_name: str):
     response_model=PolicyOut,
     status_code=status.HTTP_201_CREATED,
 )
-def create_policy(policy: PolicyIn, caller: dict = Depends(require_policy_write_access)):
-    """Create a new policy. Fails if dataset_name already exists."""
+def create_policy(policy: PolicyIn, caller: dict = Depends(get_caller)):
+    """
+    Create a new policy. Fails if dataset_name already exists. The caller
+    must hold at least one of the roles being granted in the new policy.
+    `owner` is server-set to the caller's user id, not caller-supplied.
+    """
     def _log(result_status: str, reason: str = None):
         audit.log_access(
-            caller["user_id"], caller["username"], caller["org_ids"],
+            caller["user_id"], caller["username"], caller["roles"],
             policy.dataset_name, "create_policy", result_status, reason,
         )
 
+    _require_role_overlap(caller["roles"], policy.policy.roles, policy.dataset_name)
+
     doc = policy.model_dump()
+    doc["owner"] = caller["user_id"]
     doc["created_at"] = datetime.now(timezone.utc)
     try:
         _collection.insert_one(doc)
@@ -149,31 +152,40 @@ def create_policy(policy: PolicyIn, caller: dict = Depends(require_policy_write_
     "/{dataset_name}",
     response_model=PolicyOut,
 )
-def update_policy(dataset_name: str, policy: PolicyIn, caller: dict = Depends(require_policy_write_access)):
+def update_policy(dataset_name: str, policy: PolicyIn, caller: dict = Depends(get_caller)):
     """
-    Replace an existing policy entirely. Preserves the original created_at.
-    If the role grants change and the dataset is already encrypted, it's
-    transparently re-encrypted against the new policy.
+    Replace an existing policy entirely. Preserves the original owner and
+    created_at. The caller must hold at least one role the EXISTING policy
+    already grants. If the role grants change and the dataset is already
+    encrypted, it's transparently re-encrypted against the new policy.
     """
     def _log(result_status: str, reason: str = None):
         audit.log_access(
-            caller["user_id"], caller["username"], caller["org_ids"],
+            caller["user_id"], caller["username"], caller["roles"],
             dataset_name, "update_policy", result_status, reason,
         )
 
     existing = _collection.find_one({"dataset_name": dataset_name})
+    if existing is None:
+        reason = f"Policy for dataset '{dataset_name}' not found."
+        _log("failure", reason)
+        _not_found(dataset_name)
+
+    try:
+        _require_role_overlap(caller["roles"], existing["policy"]["roles"], dataset_name)
+    except HTTPException as e:
+        _log("failure", str(e.detail))
+        raise
+
     doc = policy.model_dump()
     doc["dataset_name"] = dataset_name
-    doc["created_at"] = existing["created_at"] if existing else datetime.now(timezone.utc)
+    doc["owner"] = existing["owner"]
+    doc["created_at"] = existing["created_at"]
     result = _collection.find_one_and_replace(
         {"dataset_name": dataset_name},
         doc,
         return_document=True,
     )
-    if result is None:
-        reason = f"Policy for dataset '{dataset_name}' not found."
-        _log("failure", reason)
-        _not_found(dataset_name)
     try:
         _reencrypt_if_changed(dataset_name, existing, result)
     except HTTPException as e:
@@ -187,20 +199,22 @@ def update_policy(dataset_name: str, policy: PolicyIn, caller: dict = Depends(re
     "/{dataset_name}",
     response_model=PolicyOut,
 )
-def patch_policy(dataset_name: str, updates: dict, caller: dict = Depends(require_policy_write_access)):
+def patch_policy(dataset_name: str, updates: dict, caller: dict = Depends(get_caller)):
     """
-    Partially update a policy (only supplied fields are changed). If the
-    role grants change and the dataset is already encrypted, it's
+    Partially update a policy (only supplied fields are changed). The
+    caller must hold at least one role the EXISTING policy already grants.
+    If the role grants change and the dataset is already encrypted, it's
     transparently re-encrypted against the new policy.
     """
     def _log(result_status: str, reason: str = None):
         audit.log_access(
-            caller["user_id"], caller["username"], caller["org_ids"],
+            caller["user_id"], caller["username"], caller["roles"],
             dataset_name, "patch_policy", result_status, reason,
         )
 
-    # Disallow changing identity fields via patch
+    # Disallow changing server-controlled fields via patch
     updates.pop("dataset_name", None)
+    updates.pop("owner", None)
     updates.pop("created_at", None)
     if not updates:
         reason = "No fields to update."
@@ -208,15 +222,22 @@ def patch_policy(dataset_name: str, updates: dict, caller: dict = Depends(requir
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=reason)
 
     existing = _collection.find_one({"dataset_name": dataset_name})
+    if existing is None:
+        reason = f"Policy for dataset '{dataset_name}' not found."
+        _log("failure", reason)
+        _not_found(dataset_name)
+
+    try:
+        _require_role_overlap(caller["roles"], existing["policy"]["roles"], dataset_name)
+    except HTTPException as e:
+        _log("failure", str(e.detail))
+        raise
+
     result = _collection.find_one_and_update(
         {"dataset_name": dataset_name},
         {"$set": updates},
         return_document=True,
     )
-    if result is None:
-        reason = f"Policy for dataset '{dataset_name}' not found."
-        _log("failure", reason)
-        _not_found(dataset_name)
     try:
         _reencrypt_if_changed(dataset_name, existing, result)
     except HTTPException as e:
@@ -230,17 +251,25 @@ def patch_policy(dataset_name: str, updates: dict, caller: dict = Depends(requir
     "/{dataset_name}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
-def delete_policy(dataset_name: str, caller: dict = Depends(require_policy_write_access)):
-    """Delete a policy."""
+def delete_policy(dataset_name: str, caller: dict = Depends(get_caller)):
+    """Delete a policy. The caller must hold at least one role it already grants."""
     def _log(result_status: str, reason: str = None):
         audit.log_access(
-            caller["user_id"], caller["username"], caller["org_ids"],
+            caller["user_id"], caller["username"], caller["roles"],
             dataset_name, "delete_policy", result_status, reason,
         )
 
-    result = _collection.delete_one({"dataset_name": dataset_name})
-    if result.deleted_count == 0:
+    existing = _collection.find_one({"dataset_name": dataset_name})
+    if existing is None:
         reason = f"Policy for dataset '{dataset_name}' not found."
         _log("failure", reason)
         _not_found(dataset_name)
+
+    try:
+        _require_role_overlap(caller["roles"], existing["policy"]["roles"], dataset_name)
+    except HTTPException as e:
+        _log("failure", str(e.detail))
+        raise
+
+    _collection.delete_one({"dataset_name": dataset_name})
     _log("success")

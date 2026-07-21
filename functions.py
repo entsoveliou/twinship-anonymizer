@@ -21,7 +21,7 @@ def get_minio_client():
 def upload_to_encrypted_bucket(dataset_name, file_data_bytes) -> bool:
     """
     Receives raw file data, encrypts it with a fresh per-file DEK, wraps that
-    DEK once per organization granted in the dataset's ABAC policy, and
+    DEK once per role granted in the dataset's ABAC policy, and
     uploads the encrypted content to the destination bucket. Datasets with no
     policy fail (logged, not processed) since there's no fallback — the
     caller is expected to retry on a later poll once a policy exists.
@@ -44,13 +44,11 @@ def upload_to_encrypted_bucket(dataset_name, file_data_bytes) -> bool:
         dek = crypto_utils.generate_dek()
         encrypted_bytes = crypto_utils.encrypt_content(file_data_bytes, dek, aad)
 
-        print(f"Encrypting '{dataset_name}', wrapping DEK for {len(roles)} organization(s)...")
-        for grant in roles:
-            org_id = grant["organizationId"]
-            access = grant["access"]
-            kek = keys.get_org_tier_key(org_id, access)
+        print(f"Encrypting '{dataset_name}', wrapping DEK for {len(roles)} role(s)...")
+        for role in roles:
+            kek = keys.get_role_key(role)
             wrapped_dek = crypto_utils.wrap_key(kek, dek, aad)
-            keys.store_wrapped_key(dataset_name, org_id, access, wrapped_dek)
+            keys.store_wrapped_key(dataset_name, role, wrapped_dek)
 
         data_stream = io.BytesIO(encrypted_bytes)
 
@@ -145,7 +143,7 @@ def file_exists_in_encrypted_bucket(dataset_name) -> bool:
 
 def decrypt_dataset(dataset_name: str) -> bytes | None:
     """
-    Decrypts a dataset's current encrypted content using ANY org's existing
+    Decrypts a dataset's current encrypted content using ANY role's existing
     wrapped key — unlike getUnencryptedFile, this isn't answering "can this
     caller read it," it's "recover the plaintext so it can be re-encrypted
     against an updated policy." Returns None if that's not possible (no
@@ -154,10 +152,10 @@ def decrypt_dataset(dataset_name: str) -> bytes | None:
     entry = keys.get_any_wrapped_entry(dataset_name)
     if entry is None:
         return None
-    org_id, access, wrapped_dek = entry
+    role, wrapped_dek = entry
 
     aad = dataset_name.encode()
-    kek = keys.get_org_tier_key(org_id, access)
+    kek = keys.get_role_key(role)
     dek = crypto_utils.unwrap_key(kek, wrapped_dek, aad)
     if dek is None:
         return None
@@ -170,10 +168,10 @@ def reencrypt_dataset(dataset_name: str) -> bool:
     """
     Re-encrypts an already-encrypted dataset against its CURRENT policy —
     call this after a policy update changes an existing dataset's roles, so
-    getUnencryptedFile doesn't break for added/changed orgs. Decrypts with
+    getUnencryptedFile doesn't break for added/changed roles. Decrypts with
     any existing wrapped key, discards the old wrapped-key entries (so
-    removed orgs don't leave dangling ones), and re-encrypts with a fresh
-    DEK wrapped for every org in the now-current policy.
+    removed roles don't leave dangling ones), and re-encrypts with a fresh
+    DEK wrapped for every role in the now-current policy.
 
     Returns False (no-op) if the dataset was never encrypted in the first
     place — nothing to re-encrypt yet. Raises RuntimeError if the dataset

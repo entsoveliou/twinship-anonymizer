@@ -26,8 +26,10 @@ MONGO_DB = os.getenv("MONGO_DB", "datasetPolicies")
 # --- JWT / Auth Configuration ---
 JWT_ALGORITHM = "RS256"
 
-# In production, set JWT_PUBLIC_KEY env var to the Keycloak realm public key (PEM format).
-# For development, the key is loaded from dev_keys/public.pem.
+# Set JWT_PUBLIC_KEY env var to the partner Keycloak realm's public key (PEM
+# format) to verify real tokens. The dev keypair in dev_keys/ is separate and
+# unrelated to Keycloak's own keys — it's only ever used to sign/verify
+# tokens minted by the local /api/v1/dev/token endpoint.
 _default_public_key = ""
 _default_private_key = ""
 try:
@@ -45,9 +47,15 @@ def _normalize_pem(value: str) -> str:
     return value.replace("\\n", "\n") if value else value
 
 
-# `or` (not getenv's default arg) so an env var present-but-blank — e.g. from
-# an env_file line like "JWT_PUBLIC_KEY=" — still falls back to the dev key,
-# instead of silently becoming an empty, unusable key.
-JWT_PUBLIC_KEY = _normalize_pem(os.getenv("JWT_PUBLIC_KEY") or _default_public_key)
+# The partner/Keycloak-issued verification key, if configured — empty string
+# if unset. No fallback here (unlike before): dev-token verification is
+# handled separately by DEV_JWT_PUBLIC_KEY below, so auth.verify_token can
+# accept tokens signed by EITHER key at once, rather than only whichever one
+# this variable happens to hold.
+JWT_PUBLIC_KEY = _normalize_pem(os.getenv("JWT_PUBLIC_KEY") or "")
+# Always loaded from the bundled dev keypair (if present) so tokens minted by
+# /api/v1/dev/token keep verifying even after JWT_PUBLIC_KEY is set to a real
+# partner key.
+DEV_JWT_PUBLIC_KEY = _normalize_pem(_default_public_key)
 # Private key is ONLY used by the dev token endpoint — never in production
 JWT_PRIVATE_KEY = _normalize_pem(os.getenv("JWT_PRIVATE_KEY") or _default_private_key)

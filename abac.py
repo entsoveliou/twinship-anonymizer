@@ -3,14 +3,9 @@ from fastapi import HTTPException, status
 from pymongo import MongoClient
 
 import settings
-from crypto_utils import TIER_ORDER
 
 _client = MongoClient(settings.MONGO_URI)
 _collection = _client[settings.MONGO_DB]["policies"]
-
-# TIER_ORDER is highest -> lowest ("admin", "rw", "ro", "c-ro"); rank it so
-# higher access = higher number, for simple >= comparisons.
-TIER_RANK = {tier: len(TIER_ORDER) - 1 - i for i, tier in enumerate(TIER_ORDER)}
 
 
 def _find_policy(dataset_name: str) -> dict | None:
@@ -33,74 +28,47 @@ def get_dataset_policy(dataset_name: str) -> dict:
     return policy
 
 
-def get_org_access(dataset_name: str, organization_id: str) -> str | None:
-    """Returns the access tier granted to a specific org on a dataset, if any."""
-    policy = get_dataset_policy(dataset_name)
-    for r in policy["policy"]["roles"]:
-        if r["organizationId"] == organization_id:
-            return r["access"]
-    return None
-
-
-def resolve_access(user_orgs: list[dict], dataset_name: str) -> str | None:
+def resolve_access(user_roles: list[str], dataset_name: str) -> str | None:
     """
-    Finds an organization the caller can use to access this dataset.
+    Finds a role the caller holds that this dataset's policy also grants.
 
-    The bar is always exactly what the policy recorded for that org — never
-    a separate hardcoded floor. A caller's token carries a per-org access
-    claim (their own clearance within that org); the policy carries a
-    per-org access grant (what tier that org is entitled to on this
-    dataset). The caller qualifies only if their own claimed tier meets or
-    exceeds what their org was granted — a lower personal clearance than
-    your org's grant doesn't let you exercise that grant. If multiple orgs
-    qualify, the one with the caller's highest claimed tier wins (relevant
-    for which org's wrapped key gets used to decrypt).
-
-    Returns the matched organizationId, or None if no org qualifies
-    (including "dataset has no policy at all").
+    A dataset's policy lists the roles that qualify for access (any-of
+    match — the caller needs at least one, not all of them). Returns any
+    one matched role, or None if none qualify (including "dataset has no
+    policy at all"). Which matched role is returned doesn't matter
+    functionally — every qualifying role's wrapped DEK decrypts to the same
+    plaintext — so the first match found while walking the caller's own
+    role list is used as a simple, deterministic choice.
     """
     policy = _find_policy(dataset_name)
     if policy is None:
         return None
 
-    granted = {r["organizationId"]: r["access"] for r in policy["policy"]["roles"]}
-
-    best_org = None
-    best_rank = -1
-    for o in user_orgs:
-        org_id = o.get("organizationId")
-        user_tier = o.get("access")
-        policy_tier = granted.get(org_id)
-        if policy_tier is None:
-            continue
-        user_rank = TIER_RANK.get(user_tier, -1)
-        if user_rank < TIER_RANK.get(policy_tier, len(TIER_RANK)):
-            continue  # caller's own clearance doesn't meet what their org was granted
-        if user_rank > best_rank:
-            best_rank = user_rank
-            best_org = org_id
-
-    return best_org
+    granted = set(policy["policy"]["roles"])
+    for role in user_roles:
+        if role in granted:
+            return role
+    return None
 
 
-def check_dataset_access(user_orgs: list[dict], dataset_name: str) -> bool:
+def check_dataset_access(user_roles: list[str], dataset_name: str) -> bool:
     """
-    Never raises — a dataset with no policy, or no qualifying org, simply
+    Never raises — a dataset with no policy, or no qualifying role, simply
     isn't accessible (useful for list/filter callers).
     """
-    return resolve_access(user_orgs, dataset_name) is not None
+    return resolve_access(user_roles, dataset_name) is not None
 
 
-def require_dataset_access(dataset_name: str, user_orgs: list[dict]) -> str:
+def require_dataset_access(dataset_name: str, user_roles: list[str]) -> str:
     """
     Enforces the dataset-level ABAC policy. Raises 404 if the dataset has no
     policy at all, 403 if a policy exists but the caller doesn't qualify.
-    Returns the matched organizationId on success, so callers (e.g.
-    decryption) don't need to re-resolve it.
+    Returns the matched role on success, so callers (e.g. decryption) don't
+    need to re-resolve it.
     """
-    matched_org = resolve_access(user_orgs, dataset_name)
-    if matched_org is not None:
-        return matched_org
+    matched_role = resolve_access(user_roles, dataset_name)
+    if matched_role is not None:
+        return matched_role
     if _find_policy(dataset_name) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -110,6 +78,6 @@ def require_dataset_access(dataset_name: str, user_orgs: list[dict]) -> str:
         status_code=status.HTTP_403_FORBIDDEN,
         detail=(
             f"Access denied for dataset '{dataset_name}'. "
-            f"Your organizations: {user_orgs}"
+            f"Your roles: {user_roles}"
         ),
     )

@@ -17,8 +17,8 @@ import functions
 import crypto_utils
 import keys
 import audit
-from auth import get_organizations, get_caller, verify_token
-from abac import require_dataset_access, get_org_access, check_dataset_access
+from auth import get_roles, get_caller, verify_token
+from abac import require_dataset_access, check_dataset_access
 from policies_router import router as policies_router
 from audit_router import router as audit_router
 
@@ -176,34 +176,30 @@ async def issue_dev_token(
         sub: str = Query("dev-user", description="Subject (user id)"),
         preferred_username: str = Query("developer", description="Username"),
         email: str = Query("developer@example.com", description="Email claim"),
-        organizations: str = Query(
-            "UBI:admin",
-            description="Comma-separated organizationId:access pairs, e.g. 'UBI:admin,WAR:c-ro'",
+        roles: str = Query(
+            "data-gr",
+            description="Comma-separated realm role names, e.g. 'data-gr,model-gr,apps'",
         ),
         realm: str = Query("twinship", description="Realm name, shapes the 'iss' claim and default realm roles"),
         expires_in: int = Query(3600, description="Token lifetime in seconds"),
 ):
     """
-    DEV ONLY — mints an RS256 JWT shaped like a real Keycloak access token
-    (standard claims: iss/aud/azp/session_state/realm_access/resource_access/
-    scope/email/etc.) on top of the 'organizations' claim, signed with the
-    local dev private key. This endpoint 501s if no private key is
-    configured, which is the production posture — a partner Keycloak issues
-    real tokens instead, and only JWT_PUBLIC_KEY needs to change to verify
-    them; the claim shape this app actually reads ('organizations') is
-    identical either way. Every other claim here is cosmetic realism, not
-    used for any authorization decision in this app.
+    DEV ONLY — mints an RS256 JWT shaped exactly like a real Keycloak access
+    token (same claim keys as a real partner-issued token: iss/aud/azp/sid/
+    acr/allowed-origins/realm_access/resource_access/scope/email/etc.),
+    signed with the local dev private key, so dev tokens are structurally
+    interchangeable with production ones for testing. This endpoint 501s if
+    no private key is configured, which is the production posture — a
+    partner Keycloak issues real tokens instead, and only JWT_PUBLIC_KEY
+    needs to change to verify them; the claim shape this app actually reads
+    ('realm_access.roles') is identical either way. Every other claim here
+    is cosmetic realism, not used for any authorization decision in this
+    app (verify_token never enforces issuer/audience).
     """
     if not settings.JWT_PRIVATE_KEY:
         raise HTTPException(status_code=501, detail="No private key configured. This endpoint is for development only.")
 
-    org_grants = []
-    for pair in organizations.split(","):
-        pair = pair.strip()
-        if not pair:
-            continue
-        org_id, _, access = pair.partition(":")
-        org_grants.append({"organizationId": org_id.strip(), "access": (access or "c-ro").strip()})
+    extra_roles = [r.strip() for r in roles.split(",") if r.strip()]
 
     now = datetime.now(timezone.utc)
     session_id = str(uuid.uuid4())
@@ -211,9 +207,6 @@ async def issue_dev_token(
     payload = {
         "exp": now + timedelta(seconds=expires_in),
         "iat": now,
-        # auth_time isn't one of PyJWT's auto-converted datetime fields
-        # (only exp/iat/nbf are) — needs an explicit Unix timestamp.
-        "auth_time": int(now.timestamp()),
         "jti": str(uuid.uuid4()),
         "iss": f"http://localhost:8080/realms/{realm}",
         "aud": "account",
@@ -221,11 +214,11 @@ async def issue_dev_token(
         "typ": "Bearer",
         "azp": "twinship-anonymizer",
         "sid": session_id,
-        "session_state": session_id,
         "acr": "1",
-        "allowed-origins": ["*"],
+        "allowed-origins": ["/*"],
+        # The only claim this app actually authorizes against:
         "realm_access": {
-            "roles": [f"default-roles-{realm}", "offline_access", "uma_authorization"]
+            "roles": [f"default-roles-{realm}", "offline_access", "uma_authorization"] + extra_roles
         },
         "resource_access": {
             "account": {"roles": ["manage-account", "manage-account-links", "view-profile"]}
@@ -237,8 +230,6 @@ async def issue_dev_token(
         "given_name": preferred_username,
         "family_name": "",
         "email": email,
-        # The only claim this app actually authorizes against:
-        "organizations": org_grants,
     }
     token = jwt.encode(
         payload,
@@ -263,28 +254,28 @@ async def verify_jwt(payload: dict = Depends(verify_token)):
 
 
 @app.get("/api/v1/listFiles")
-async def list_files(orgs: list[dict] = Depends(get_organizations)):
+async def list_files(roles: list[str] = Depends(get_roles)):
     """
     Returns a JSON array of file names in the encrypted bucket, filtered to
-    those the caller's claimed tier meets or exceeds their org's policy grant on.
+    those the caller holds a role for, per each dataset's policy.
     """
     try:
         all_files = functions.list_files_in_encrypted_bucket()
-        accessible = [f for f in all_files if check_dataset_access(orgs, f)]
+        accessible = [f for f in all_files if check_dataset_access(roles, f)]
         return {"files": accessible, "count": len(accessible)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/v1/listFilesByBucket")
-async def list_files_by_bucket(bucket: str = Query(..., description="Name of the bucket to list files from"), orgs: list[dict] = Depends(get_organizations)):
+async def list_files_by_bucket(bucket: str = Query(..., description="Name of the bucket to list files from"), roles: list[str] = Depends(get_roles)):
     """
     Returns a JSON array of all file names in the specified bucket, filtered
-    to those the caller's claimed tier meets or exceeds their org's policy grant on.
+    to those the caller holds a role for, per each dataset's policy.
     """
     try:
         all_files = functions.list_files_in_bucket(bucket)
-        accessible = [f for f in all_files if check_dataset_access(orgs, f)]
+        accessible = [f for f in all_files if check_dataset_access(roles, f)]
         return {"bucket": bucket, "files": accessible, "count": len(accessible)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -294,36 +285,32 @@ async def list_files_by_bucket(bucket: str = Query(..., description="Name of the
 def get_unencrypted_file(filename: str, caller: dict = Depends(get_caller)):
     """
     Downloads the file, decrypts it, and returns the clean content.
-    Dataset ABAC: the caller must have an org where their own claimed tier
-    meets or exceeds what the policy granted that org — no separate
-    hardcoded floor. The matched org's policy-recorded tier is then used to
-    unwrap that org's copy of the DEK (the tier it was wrapped with).
-    Every attempt (success or failure) is written to the access audit log.
+    Dataset ABAC: the caller must hold at least one role the dataset's
+    policy grants. The matched role is then used directly to unwrap that
+    role's copy of the DEK. Every attempt (success or failure) is written
+    to the access audit log.
     """
-    org_ids = caller["org_ids"]
+    roles = caller["roles"]
 
     def _log(status: str, reason: str = None):
-        audit.log_access(caller["user_id"], caller["username"], org_ids, filename, "getUnencryptedFile", status, reason)
+        audit.log_access(caller["user_id"], caller["username"], roles, filename, "getUnencryptedFile", status, reason)
 
     try:
         # 1. Check dataset-level ABAC (raises 404/403 if denied); returns the
-        #    caller's best-matching organization on this dataset.
-        matched_org = require_dataset_access(filename, caller["organizations"])
+        #    caller's matching role on this dataset.
+        matched_role = require_dataset_access(filename, roles)
 
         # 2. Download raw encrypted bytes from MinIO
         encrypted_bytes = functions.download_file_from_encrypted_bucket(filename)
 
-        # 3. Unwrap that organization's copy of the DEK, using the tier
-        #    recorded in the POLICY (not the caller's claimed tier) — that's
-        #    what it was wrapped with at encryption time.
-        access = get_org_access(filename, matched_org)
-        wrapped = keys.get_wrapped_key(filename, matched_org)
-        if wrapped is None:
-            raise HTTPException(status_code=500, detail="No wrapped key found for this organization/dataset.")
+        # 3. Unwrap that role's copy of the DEK.
+        wrapped_dek = keys.get_wrapped_key(filename, matched_role)
+        if wrapped_dek is None:
+            raise HTTPException(status_code=500, detail="No wrapped key found for this role/dataset.")
 
         aad = filename.encode()
-        kek = keys.get_org_tier_key(matched_org, access)
-        dek = crypto_utils.unwrap_key(kek, wrapped["wrapped_dek"], aad)
+        kek = keys.get_role_key(matched_role)
+        dek = crypto_utils.unwrap_key(kek, wrapped_dek, aad)
         if dek is None:
             raise HTTPException(status_code=403, detail="Decryption Failed: Invalid attributes or corrupted key.")
 
@@ -361,14 +348,14 @@ def get_encrypted_file(filename: str, caller: dict = Depends(get_caller)):
     diagnostic view for callers who already qualify for real read access.
     Every attempt (success or failure) is written to the access audit log.
     """
-    org_ids = caller["org_ids"]
+    roles = caller["roles"]
 
     def _log(status: str, reason: str = None):
-        audit.log_access(caller["user_id"], caller["username"], org_ids, filename, "getEncryptedFile", status, reason)
+        audit.log_access(caller["user_id"], caller["username"], roles, filename, "getEncryptedFile", status, reason)
 
     try:
         # 1. Check dataset-level ABAC (raises 404/403 if denied)
-        require_dataset_access(filename, caller["organizations"])
+        require_dataset_access(filename, roles)
 
         # 2. Download raw encrypted bytes from MinIO
         encrypted_bytes = functions.download_file_from_encrypted_bucket(filename)
