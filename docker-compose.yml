@@ -27,9 +27,9 @@ services:
       # Bind mount, deliberately NOT a named volume: `docker compose down -v`
       # only destroys named volumes declared below (mongo-data), so this
       # host directory survives that command untouched. That's the whole
-      # point — down -v is the documented recovery step for schema
-      # migrations (see CLAUDE.md), and the backup snapshots need to
-      # outlive it, not get wiped alongside mongo-data.
+      # point — down -v is the recovery step for breaking schema
+      # migrations, and the backup snapshots need to outlive it, not get
+      # wiped alongside mongo-data.
       - ./backups:/app/backups
     ports:
       - "8000:8000"

@@ -13,9 +13,9 @@
 # unique index.
 #
 # ⚠️ Do NOT run this after an intentional `docker compose down -v` done for
-# a schema migration (see CLAUDE.md's "Migration note"). A backup snapshot
-# reflects whatever document shape was current when it was written — if
-# that shape predates a breaking schema change, restoring it reintroduces
+# a breaking schema migration (e.g. a policy document shape change). A
+# backup snapshot reflects whatever document shape was current when it was
+# written — if that shape predates the change, restoring it reintroduces
 # documents the new code can't read correctly, exactly the problem the
 # migration's fresh-volume step was meant to avoid. Restoring is only for
 # "we lost data we didn't mean to lose", never for "we want the old data
