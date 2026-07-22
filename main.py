@@ -17,6 +17,7 @@ import functions
 import crypto_utils
 import keys
 import audit
+import backup
 from auth import get_roles, get_caller, verify_token
 from abac import require_dataset_access, check_dataset_access
 from policies_router import router as policies_router
@@ -149,19 +150,43 @@ async def cleanup_unpolicied_files():
         await asyncio.sleep(settings.POLL_INTERVAL)
 
 
+# --- Background Task Logic (Local Key/Policy Backup) ---
+
+async def backup_loop():
+    """
+    Periodically snapshots the Mongo collections that hold irreplaceable key
+    material (role_secrets, dataset_keys) plus policies/prefix_policies to
+    local disk (see backup.py). role_secrets has no derivation chain, so if
+    it's ever lost with nothing to restore from, every wrapped DEK becomes
+    permanently unwrappable and every encrypted file is inert ciphertext
+    forever — this is what stands between that and a destroyed mongo-data
+    volume. Restoring from these snapshots is a deliberate manual step
+    (restore.py), never automatic.
+    """
+    while True:
+        try:
+            counts = await asyncio.to_thread(backup.backup_once)
+            print(f"[BACKUP] Snapshotted to '{settings.BACKUP_DIR}': {counts}")
+        except Exception as e:
+            print(f"Backup Error: {e}")
+        await asyncio.sleep(settings.BACKUP_INTERVAL_SECONDS)
+
+
 # --- FastAPI App Definition & Lifespan ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start BOTH tasks concurrently
+    # Start all three tasks concurrently
     task_monitor = asyncio.create_task(monitor_bucket())
     task_cleanup = asyncio.create_task(cleanup_unpolicied_files())
+    task_backup = asyncio.create_task(backup_loop())
 
     yield
 
-    # Cancel both tasks on shutdown
+    # Cancel all tasks on shutdown
     task_monitor.cancel()
     task_cleanup.cancel()
+    task_backup.cancel()
 
 
 app = FastAPI(lifespan=lifespan)

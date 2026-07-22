@@ -1,3 +1,6 @@
 .env
 __pycache__/
 *.pyc
+# Local key/policy backup snapshots (see backup.py) — contain raw role
+# secrets and wrapped DEKs, must never be committed.
+/backups/

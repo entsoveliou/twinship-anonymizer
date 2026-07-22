@@ -11,9 +11,34 @@ db.createUser({
     roles: [{ role: "readWrite", db: "datasetPolicies" }]
 });
 
-// --- Dataset policies (one document per dataset, no fallback) ---
+// --- Dataset policies (one document per dataset, exact match) ---
 db.createCollection('policies');
 db.policies.createIndex({ dataset_name: 1 }, { unique: true });
+
+// --- Predefined prefix policies (fallback tier, resource categories) ---
+// Consulted only when a dataset has no exact 'policies' entry — see
+// abac.py:_find_policy. Unlike 'policies', these are NOT managed through the
+// API at all (no CRUD router): they're fixed, seeded here once, and only
+// ever change via a fresh migration to this file. The role lists below are
+// each a single granular resource role, derived from the consortium's
+// User-Role Type -> granular-role composite mapping (policies_router.py:
+// USER_ROLE_TYPE_ROLES) so that exactly the right User-Role Types qualify
+// for each resource category.
+db.createCollection('prefix_policies');
+db.prefix_policies.createIndex({ prefix: 1 }, { unique: true });
+
+var _now = new Date();
+db.prefix_policies.insertMany([
+    { prefix: 'grimaldi-data-',  policy: { roles: ['data-gr'] },  created_at: _now },
+    { prefix: 'stena-tk-data-',  policy: { roles: ['data-st'] },  created_at: _now },
+    { prefix: 'stena-li-data-',  policy: { roles: ['data-sl'] },  created_at: _now },
+    { prefix: 'grimaldi-model-', policy: { roles: ['model-gr'] }, created_at: _now },
+    { prefix: 'stena-tk-model-', policy: { roles: ['model-st'] }, created_at: _now },
+    { prefix: 'stena-li-model-', policy: { roles: ['model-sl'] }, created_at: _now },
+    { prefix: 'weather-router-', policy: { roles: ['apps'] },     created_at: _now },
+    { prefix: 'lcca-',           policy: { roles: ['apps'] },     created_at: _now },
+    { prefix: 'iea-',            policy: { roles: ['apps'] },     created_at: _now },
+]);
 
 // --- Auto-provisioned per-role root secrets ---
 db.createCollection('role_secrets');
@@ -35,6 +60,7 @@ db.access_logs.createIndex({ timestamp: -1 });
 // the org_secrets -> role_secrets rename needs `docker compose down -v`
 // (destroys all existing policies/keys/audit log) to pick this up.
 
-// No seed policies on purpose: every dataset needs an explicit policy
-// created via POST /api/v1/policies before its file is uploaded. There is
-// no fallback/default policy in this system.
+// No seed EXACT policies on purpose: a dataset with no exact policy and no
+// matching prefix still needs POST /api/v1/policies before its file is
+// uploaded/read. There is still no catch-all "default" policy — only the
+// two tiers above (exact, then prefix).

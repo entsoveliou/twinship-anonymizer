@@ -1,10 +1,48 @@
 # Twinship Anonymizer
 
+## Getting Started
+
+Bring the anonymizer up on your own premises and confirm it end-to-end:
+
+1. **Clone the repo onto the target host** and copy the env template:
+   ```bash
+   cp .env.example .env
+   ```
+2. **Fill in `.env`** — at minimum your MinIO endpoint/access key/secret and bucket names. Leave `JWT_PUBLIC_KEY` blank for now if you don't have your Keycloak realm's public key handy yet; the bundled dev-token flow (step 5) still works either way. See [Configuration](#configuration) for the full variable reference.
+3. **Start the stack:**
+   ```bash
+   docker-compose up --build -d
+   ```
+   This runs the bundled Mongo (schema/indexes only, no seed policies beyond the [predefined prefix policies](#predefined-prefix-policies)) plus the app on `:8000`.
+4. **Confirm it's up** — interactive API docs at `http://<host>:8000/docs`.
+5. **Get a Bearer token.** If `JWT_PUBLIC_KEY` is configured, use a real Keycloak-issued token. Otherwise, mint a local dev token (see [Development Token Issuance](#development-token-issuance-apiv1devtoken)):
+   ```bash
+   curl -s -X POST "http://localhost:8000/api/v1/dev/token?roles=data-gr"
+   ```
+6. **Create a policy for your dataset** *before* uploading it — there's no fallback for a dataset matching neither an exact nor a [predefined prefix](#predefined-prefix-policies) policy:
+   ```bash
+   curl -s -X POST "http://localhost:8000/api/v1/policies/" \
+     -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+     -d '{"dataset_name": "example.csv", "policy": {"roles": ["data-gr"]}}'
+   ```
+7. **Drop the file into `SOURCE_BUCKET`** (MinIO). Within `POLL_INTERVAL` seconds it's automatically encrypted into `DESTINATION_BUCKET` and the raw copy is removed — see [Continuous Encryption Monitor](#anonymizer).
+8. **Retrieve it decrypted:**
+   ```bash
+   curl -s "http://localhost:8000/api/v1/getUnencryptedFile?filename=example.csv" \
+     -H "Authorization: Bearer <token>" -o example.csv
+   ```
+
+If step 8 returns the original file content, the full ABAC → encryption → retrieval flow is working. From here, the sections below cover policy structure, the prefix-fallback tier, envelope encryption internals, key/policy backup, and the full API surface in detail.
+
 ## Table of Contents
 
+- [Getting Started](#getting-started)
 - [Configuration](#configuration)
 - [ABAC — Attribute-Based Access Control](#abac--attribute-based-access-control)
+  - [Policy Lookup — Exact Match, Then Prefix Fallback](#policy-lookup--exact-match-then-prefix-fallback)
+  - [Predefined Prefix Policies](#predefined-prefix-policies)
 - [ABE — Attribute-Based Encryption](#abe--attribute-based-encryption)
+  - [Local Key/Policy Backup](#local-keypolicy-backup)
 - [Anonymizer](#anonymizer)
 
 ---
@@ -62,9 +100,44 @@ Access control is enforced at the **dataset level**: every file in the encrypted
 
 Roles are flat, resource-shaped Keycloak realm role names (e.g. `data-gr`, `model-st`, `apps`) — no organizations, no access tiers. The consortium also defines coarser "User-Role Type" names (e.g. `UserGR`, `UserSU`) as Keycloak **composite roles**: assigning one to a user auto-expands into the underlying resource roles in their token. Policies only ever reference the granular resource roles, never the composite type names — so adding or changing a user-type later never requires touching existing policies, only Keycloak's composite-role config.
 
-### Policy Lookup — No Fallback
+### Policy Lookup — Exact Match, Then Prefix Fallback
 
-Every dataset must have its own exact-match policy, keyed on `dataset_name`. There is **no prefix matching and no default policy** — a dataset with no policy is a hard error (`404`). **Create the policy before dropping the file into the source bucket**; a file that arrives with no matching policy is skipped by the encryption monitor, not silently processed under a fallback.
+Dataset policy lookup is two-tier:
+
+1. **Exact match** — a `policies` document keyed on the exact `dataset_name`. This is the dynamic, fully-mutable tier: create it via the REST API below, then drop the file (the normal "create policy, then upload" flow).
+2. **Prefix match** — if no exact policy exists, fall back to the first `prefix_policies` document whose `prefix` the dataset name starts with (see [Predefined Prefix Policies](#predefined-prefix-policies) below).
+
+A dataset matching **neither** tier is a hard error (`404`) — there is still no catch-all default policy. **Create an exact policy, or rely on a matching prefix, before dropping the file into the source bucket**; a file that arrives with no matching policy at either tier is skipped by the encryption monitor and retried on every poll, not silently processed.
+
+Both the background encryption monitor and every read/list endpoint share this exact same two-tier lookup (`abac.py:_find_policy`) — a file dropped under a known prefix auto-encrypts and is readable with no exact policy ever created for it, identically to one with an explicit policy.
+
+### Predefined Prefix Policies
+
+`prefix_policies` documents are **seeded once** (via `mongo/init/01-init.js`) and have **no CRUD surface anywhere in the API** — unlike `policies`, they can't be created, updated, or deleted at runtime. They exist to pre-authorize the consortium's known resource categories without requiring an exact policy per dataset file:
+
+```json
+{
+  "prefix": "grimaldi-data-",
+  "policy": { "roles": ["data-gr"] },
+  "created_at": "2026-07-22T00:00:00Z"
+}
+```
+
+Seeded set, one per resource category, each granting the single granular role for that resource (the same roles [User-Role Types expand into](#creating-a-policy-by-user-role-type), so exactly the right User-Role Types qualify with no separate mapping to maintain):
+
+| Prefix | Granted role(s) | Resource |
+|--------|------------------|----------|
+| `grimaldi-data-` | `data-gr` | Data: Grimaldi |
+| `stena-tk-data-` | `data-st` | Data: Stena TK |
+| `stena-li-data-` | `data-sl` | Data: Stena LI |
+| `grimaldi-model-` | `model-gr` | Model: Grimaldi |
+| `stena-tk-model-` | `model-st` | Model: Stena TK |
+| `stena-li-model-` | `model-sl` | Model: Stena LI |
+| `weather-router-` | `apps` | App: Weather Router |
+| `lcca-` | `apps` | App: LCCA |
+| `iea-` | `apps` | App: IEA |
+
+Changing these prefixes/roles means editing `mongo/init/01-init.js` and re-running it against a fresh Mongo volume (`docker compose down -v` — init scripts only run on an empty data directory) — there's deliberately no runtime way to add, edit, or remove one.
 
 ### Access Check
 
@@ -80,7 +153,8 @@ This check is identical for every endpoint that enforces ABAC — `getEncryptedF
 
 | Collection | Key field | Used for |
 |------------|-----------|----------|
-| `policies` | `dataset_name` | Dataset access policies |
+| `policies` | `dataset_name` | Dataset access policies (exact match, fully mutable via the REST API) |
+| `prefix_policies` | `prefix` | Predefined, immutable fallback policies for known resource-category prefixes (see [Predefined Prefix Policies](#predefined-prefix-policies)) — no CRUD API, seeded once |
 | `role_secrets` | `role` | Auto-provisioned root secret per role, used directly as that role's encryption key |
 | `dataset_keys` | `dataset_name` | Per-role wrapped data-encryption-keys for each encrypted dataset |
 | `access_logs` | — | Audit log of every `getEncryptedFile`/`getUnencryptedFile` request, success or failure |
@@ -132,6 +206,45 @@ Wrapped keys live in the `dataset_keys` collection, one entry per role per datas
 
 > Existing files encrypted under a previous scheme (the original fixed-key scheme, or the earlier organization/tier model) are not decryptable under this scheme — key derivation is entirely different each time. Affected datasets need to be re-dropped into the source bucket for re-encryption once their policy exists under the current `{roles: [...]}` shape.
 
+### Local Key/Policy Backup
+
+`role_secrets` has no derivation chain — each secret is a standalone `os.urandom(32)`, nothing else can regenerate it. A crashed `mongod` process is not a risk (the data lives on a durable Docker volume and the container restarts automatically), but a **destroyed** `mongo-data` volume — disk failure, an accidental `docker compose down -v`, host loss — is: every wrapped DEK in `dataset_keys` becomes permanently unwrappable, and every file in the encrypted bucket turns into inert ciphertext forever.
+
+A background loop (`backup_loop()` in `main.py`, logic in `backup.py`) snapshots the four collections that matter — `role_secrets`, `dataset_keys`, `policies`, `prefix_policies` — to local JSON files every `BACKUP_INTERVAL_SECONDS` (default `300`). No external service is involved:
+
+- Snapshots are written to `BACKUP_DIR` (`/app/backups` inside the `app` container), one JSON file per collection, using `bson.json_util` so `Binary`/`ObjectId` fields (the actual key bytes) round-trip byte-for-byte, not just plain JSON-safe values.
+- Each write goes to a temp file first, then an atomic `os.replace` into place — a crash mid-write can never corrupt the last-known-good snapshot.
+- In `docker-compose.yml`, `./backups` is mounted into the `app` container as a **bind mount, not a named volume** — on purpose, since `docker compose down -v` only destroys named volumes (`mongo-data`), and the backup needs to survive exactly the command that might destroy the thing it's backing up.
+
+**Restoring is always a deliberate, manual step — never automatic.** Run `python restore.py` (add `-y` to skip the confirmation prompt) to upsert every snapshot's documents back into Mongo, matched by each collection's real business key (`role`, `dataset_name`, or `prefix` — not the backed-up `_id`, so it can't collide with documents `mongo/init/01-init.js` already re-seeded on a fresh volume, e.g. `prefix_policies`). This is intentionally not wired into app startup: auto-restoring would silently reintroduce old-shape documents after an intentional schema-migration wipe (see the org/tier → role rewrite mentioned above), undoing the very fresh-volume step that migration needs. Only run it for genuine, unintended data loss — never after a deliberate `docker compose down -v` done to pick up a schema change.
+
+#### Recovering After Mongo Data Loss
+
+If the `mongo-data` volume itself is destroyed or corrupted (not just a crashed/restarted container — that case needs nothing, the volume is untouched), restore the pre-loss state instead of starting from a clean deploy:
+
+```bash
+# 1. Confirm the backups survived (they're on a bind mount, independent of mongo-data)
+ls -la ./backups
+
+# 2. Force a clean recreate of the broken volume — does NOT touch ./backups
+docker compose down -v
+
+# 3. Bring everything back up; mongo/init/01-init.js reruns (fresh collections/indexes,
+#    re-seeds the 9 predefined prefix_policies)
+docker compose up --build -d
+
+# 4. Restore role_secrets/dataset_keys/policies, and overwrite the freshly reseeded
+#    prefix_policies with your exact prior copies
+docker compose exec app python restore.py -y
+
+# 5. Sanity check — a previously-encrypted file should decrypt again
+TOKEN=$(curl -s -X POST "http://localhost:8000/api/v1/dev/token?roles=data-gr" | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+curl -s "http://localhost:8000/api/v1/getUnencryptedFile?filename=<some-existing-encrypted-file>" \
+  -H "Authorization: Bearer $TOKEN" -o /tmp/check.out && ls -la /tmp/check.out
+```
+
+If step 5 decrypts successfully, the encrypted files in `DESTINATION_BUCKET` (untouched by the Mongo loss — they live in MinIO) are readable again using the recovered keys.
+
 ### Development Token Issuance (`/api/v1/dev/token`)
 
 To interact with the encrypted files and test the ABE/ABAC flow, users must authenticate using a JWT. For development and testing purposes, a dedicated endpoint mints signed JWTs shaped exactly like a real Keycloak access token — same claim keys (`iss`, `aud`, `azp`, `sid`, `acr`, `allowed-origins`, `realm_access`, `resource_access`, `scope`, `email`, etc.) as a real partner-issued token, so dev tokens are structurally interchangeable with production ones. `realm_access.roles` is the only claim this app's authorization logic actually reads; everything else is cosmetic realism.
@@ -174,7 +287,7 @@ The module runs parallel asynchronous tasks in the background to manage the flow
 
 #### 1. Continuous Encryption Monitor
 The anonymizer continuously monitors the designated source MinIO bucket for newly uploaded files.
-- **Policy-driven:** the uploaded file's object name is looked up as a `dataset_name` in the `policies` collection. There is no fallback — if no policy exists yet, the file is left in place and retried automatically on every poll.
+- **Policy-driven:** the uploaded file's object name is looked up as a `dataset_name` — exact match in `policies` first, then prefix match in `prefix_policies` (see [Policy Lookup](#policy-lookup--exact-match-then-prefix-fallback)). If neither matches, the file is left in place and retried automatically on every poll.
 - **Automated Encryption:** once a policy is found, the system generates a fresh DEK, encrypts the file (AES-256-GCM), wraps the DEK for every role in the policy, and uploads the result to the encrypted destination bucket.
 - **Source cleanup:** immediately after a file is successfully encrypted, its raw copy is deleted from the source bucket — the source bucket is a staging area, not storage. This also self-heals across restarts: if the app crashes between "encrypted copy uploaded" and "raw copy deleted," the next startup detects the encrypted copy already exists and finishes the cleanup without re-encrypting.
 
@@ -185,6 +298,12 @@ Configured via one environment variable:
 - `POLICY_GRACE_SECONDS` *(default: `60`)*: how long a file may sit with no matching policy before it's deleted. Applies to every file in the source bucket — no prefix filtering.
 
 > Create the policy before (or within `POLICY_GRACE_SECONDS` of) dropping the file in the source bucket. Once the grace period elapses with still no policy, the raw upload is gone for good.
+
+#### 3. Local Key/Policy Backup
+A third background task periodically snapshots `role_secrets`/`dataset_keys`/`policies`/`prefix_policies` to local disk so a destroyed Mongo volume doesn't mean permanently unrecoverable ciphertext. See [Local Key/Policy Backup](#local-keypolicy-backup) above for the full explanation and `restore.py` for recovery.
+
+Configured via one environment variable:
+- `BACKUP_INTERVAL_SECONDS` *(default: `300`)*: how often a fresh local snapshot is written.
 
 ---
 

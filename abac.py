@@ -6,18 +6,46 @@ import settings
 
 _client = MongoClient(settings.MONGO_URI)
 _collection = _client[settings.MONGO_DB]["policies"]
+_prefix_collection = _client[settings.MONGO_DB]["prefix_policies"]
+
+
+def _find_prefix_policy(dataset_name: str) -> dict | None:
+    """
+    Fallback tier below the exact per-dataset policy: returns the first
+    predefined prefix policy whose prefix the dataset_name starts with, or
+    None if none match. Prefix policies are seeded once via
+    mongo/init/01-init.js and have no CRUD surface anywhere in the API —
+    this is the only place they're read from. Prefix list is expected to
+    stay small, so a plain Python scan is fine.
+    """
+    for doc in _prefix_collection.find({}, {"_id": 0}):
+        if dataset_name.startswith(doc["prefix"]):
+            return doc
+    return None
 
 
 def _find_policy(dataset_name: str) -> dict | None:
-    return _collection.find_one({"dataset_name": dataset_name}, {"_id": 0})
+    """
+    Two-tier lookup: an exact dataset_name match in 'policies' (the mutable,
+    per-dataset policies created via POST/PUT/PATCH/DELETE /api/v1/policies)
+    wins if present; otherwise falls back to a matching predefined prefix
+    policy (see _find_prefix_policy). Returns None if neither matches —
+    there's still no catch-all "default" policy.
+    """
+    policy = _collection.find_one({"dataset_name": dataset_name}, {"_id": 0})
+    if policy is not None:
+        return policy
+    return _find_prefix_policy(dataset_name)
 
 
 def get_dataset_policy(dataset_name: str) -> dict:
     """
-    Returns the ABAC policy for a dataset by exact dataset_name match.
-    There is no prefix matching and no default fallback: a dataset without
-    an explicit policy is a hard error. Create the policy before the dataset
-    shows up.
+    Returns the ABAC policy governing a dataset: exact dataset_name match if
+    one exists, else the matching predefined prefix policy. A dataset with
+    neither is a hard error. Used by both the background encryptor
+    (functions.upload_to_encrypted_bucket) and the read/ABAC paths below, so
+    a file dropped under a known prefix with no exact policy yet still
+    auto-encrypts and is readable, exactly like one with an explicit policy.
     """
     policy = _find_policy(dataset_name)
     if policy is None:

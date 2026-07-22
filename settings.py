@@ -23,6 +23,18 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 5)) # Seconds
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://root:rootpassword@localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "datasetPolicies")
 
+# --- Local Key/Policy Backup Settings ---
+# role_secrets has no derivation chain (each secret is plain os.urandom(32)),
+# so if that collection is ever lost with nothing to restore from, every
+# wrapped DEK in dataset_keys becomes permanently unwrappable and every file
+# in the encrypted bucket is inert ciphertext forever. backup.py periodically
+# snapshots role_secrets/dataset_keys/policies/prefix_policies to plain JSON
+# files under BACKUP_DIR — a local directory/volume, no external service
+# involved. Restoring is a deliberate manual step (restore.py), never
+# automatic — see restore.py's own warning about why.
+BACKUP_DIR = os.getenv("BACKUP_DIR", os.path.join(os.path.dirname(__file__), "backups"))
+BACKUP_INTERVAL_SECONDS = int(os.getenv("BACKUP_INTERVAL_SECONDS", 300))
+
 # --- JWT / Auth Configuration ---
 JWT_ALGORITHM = "RS256"
 
